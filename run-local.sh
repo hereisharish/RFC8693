@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the whole POC without Docker: needs Java 21, Maven and Python 3.
-#   ./run-local.sh        start Keycloak + 4 services, configure the realm, run the demo
+# Run the whole POC without Docker: needs Java 21 and Python 3 (downloads the stock Keycloak distribution).
+#   ./run-local.sh        start Keycloak, configure the realm, start service-1..3 and the web page
 #   ./run-local.sh stop   stop everything
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -21,10 +21,6 @@ if [[ ! -d "$KC_HOME" ]]; then
   unzip -q "$WORK/kc.zip" -d "$WORK" && rm "$WORK/kc.zip"
 fi
 
-echo "building delegation-chain provider ..."
-(cd keycloak/delegation-chain-provider && mvn -q -B package)
-cp keycloak/delegation-chain-provider/target/delegation-chain-provider.jar "$KC_HOME/providers/"
-
 echo "starting Keycloak (log: $WORK/keycloak.log) ..."
 KC_BOOTSTRAP_ADMIN_USERNAME=admin KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
 KC_FEATURES=token-exchange-delegation,parameterized-scopes \
@@ -34,9 +30,9 @@ until curl -sf http://localhost:8080/realms/master > /dev/null; do sleep 2; done
 
 python3 keycloak/setup_realm.py
 
-for i in 1 2 3 4; do
+for i in 1 2 3; do
   next=$((i + 1))
-  if (( i < 4 )); then
+  if (( i < 3 )); then
     export NEXT_SERVICE_URL="http://localhost:808$next/" NEXT_CLIENT_ID="service-$next"
   else
     unset NEXT_SERVICE_URL NEXT_CLIENT_ID
@@ -44,9 +40,11 @@ for i in 1 2 3 4; do
   SERVICE_NAME="service-$i" PORT="808$i" nohup python3 services/service.py > "$WORK/service-$i.log" 2>&1 &
   echo $! > "$WORK/service-$i.pid"
 done
-sleep 1
 
-python3 demo.py
+nohup python3 web-app/app.py > "$WORK/web-app.log" 2>&1 &
+echo $! > "$WORK/web-app.pid"
+
 echo
+echo "Open http://localhost:3000 and log in as alice / alice"
 echo "Keycloak admin console: http://localhost:8080/admin (admin/admin), realm 'rfc8693'"
-echo "service logs: $WORK/service-*.log    stop with: ./run-local.sh stop"
+echo "logs: $WORK/*.log    stop with: ./run-local.sh stop"

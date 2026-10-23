@@ -4,10 +4,12 @@
 For each request it:
   1. validates the bearer token via Keycloak introspection (must be active and addressed to this service)
   2. reports who the *user* is (sub) and who is calling on their behalf (the nested "act" chain)
-  3. if NEXT_SERVICE_URL is set: performs an RFC 8693 delegation token exchange
-       subject_token = the token it received, actor_token = its own client-credentials token,
-       scope = delegate-to:<next client>
-     and calls the next service with the new token.
+  3. if asked to go further (?hops=N, N > 0) and NEXT_SERVICE_URL is set: exchanges the token (RFC 8693) for one
+     whose audience is the next service and calls it with ?hops=N-1.
+       - token's may_act names this service -> delegation exchange (subject_token + actor_token).
+         Keycloak issues act={this service}.
+       - otherwise -> standard token exchange (subject_token only). Keycloak refuses this for a token that
+         already carries act/may_act, which is where the stock-Keycloak chain ends.
 
 Env: SERVICE_NAME, CLIENT_SECRET, PORT, KC_URL, REALM, NEXT_SERVICE_URL, NEXT_CLIENT_ID
 """
@@ -59,13 +61,22 @@ def own_token():
                                        "client_id": NAME, "client_secret": SECRET})["access_token"]
 
 
-def exchange(subject_token):
-    return post_form(f"{OIDC}/token", {
+def exchange(subject_token, may_act):
+    form = {
         "grant_type": TOKEN_EXCHANGE, "client_id": NAME, "client_secret": SECRET,
         "subject_token": subject_token, "subject_token_type": ACCESS_TOKEN_TYPE,
-        "actor_token": own_token(), "actor_token_type": ACCESS_TOKEN_TYPE,
-        "scope": f"delegate-to:{NEXT_CLIENT}",
-    })["access_token"]
+        "audience": NEXT_CLIENT,
+    }
+    if (may_act or {}).get("client_id") == NAME:
+        mode = "delegation (subject_token + actor_token)"
+        form.update(actor_token=own_token(), actor_token_type=ACCESS_TOKEN_TYPE)
+    else:
+        mode = "standard (subject_token only)"
+    try:
+        return mode, post_form(f"{OIDC}/token", form)["access_token"]
+    except HttpError as e:
+        e.mode = mode
+        raise
 
 
 def actors(act):
@@ -95,6 +106,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        hops = int(query.get("hops", ["0"])[0])
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return self.reply(401, {"service": NAME, "error": "missing bearer token"})
@@ -121,17 +134,22 @@ class Handler(BaseHTTPRequestHandler):
             "immediate_caller": chain[0] if chain else user,
             "call_path": " -> ".join(call_path),
             "act": info.get("act"),
+            "may_act": info.get("may_act"),
         }
 
-        if NEXT_URL:
+        if NEXT_URL and hops > 0:
             try:
-                new_token = exchange(token)
+                mode, new_token = exchange(token, info.get("may_act"))
             except HttpError as e:
-                result["token_exchange_error"] = json.loads(e.body) if e.body.startswith("{") else e.body
-                return self.reply(502, result)
+                result["token_exchange"] = {
+                    "target": NEXT_CLIENT, "mode": e.mode, "status": e.status,
+                    "error": json.loads(e.body) if e.body.startswith("{") else e.body}
+                print(f"[{NAME}] token exchange for {NEXT_CLIENT} refused: {e.body}", flush=True)
+                return self.reply(200, result)
             c = jwt_claims(new_token)
-            result["exchanged_token_for_next_hop"] = {k: c.get(k) for k in ("sub", "azp", "aud", "may_act", "act")}
-            req = urllib.request.Request(NEXT_URL, headers={"Authorization": f"Bearer {new_token}"})
+            result["token_exchange"] = {"target": NEXT_CLIENT, "mode": mode, "status": 200}
+            result["exchanged_token_for_next_hop"] = {k: c.get(k) for k in ("sub", "preferred_username", "azp", "aud", "act")}
+            req = urllib.request.Request(f"{NEXT_URL}?hops={hops - 1}", headers={"Authorization": f"Bearer {new_token}"})
             try:
                 with urllib.request.urlopen(req) as r:
                     result["downstream"] = json.load(r)

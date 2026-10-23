@@ -1,7 +1,7 @@
-# RFC 8693 delegation-chain POC: alice -> service-1 -> service-2 -> service-3 -> service-4
+# RFC 8693 delegation POC on stock Keycloak 26.8.1 (no custom image, no extensions)
 #
-#   docker compose up -d --build          # Keycloak + realm setup + 4 services
-#   python3 demo.py                       # or: docker compose run --rm demo
+#   docker compose up -d
+#   open http://localhost:3000   (alice / alice)
 x-service: &service
   build: ./services
   restart: unless-stopped
@@ -12,13 +12,14 @@ x-service: &service
 
 services:
   keycloak:
-    build: ./keycloak
+    image: quay.io/keycloak/keycloak:26.8.1
     command: ["start-dev", "--http-port=8080"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
-      # Tokens always carry iss=http://localhost:8080/realms/rfc8693, whether they were requested from the
-      # host (localhost:8080) or from inside the compose network (keycloak:8080).
+      KC_FEATURES: token-exchange-delegation,parameterized-scopes
+      # Tokens always carry iss=http://localhost:8080/realms/rfc8693, whether they were requested by the
+      # browser (localhost:8080) or from inside the compose network (keycloak:8080).
       KC_HOSTNAME: http://localhost:8080
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
     ports: ["8080:8080"]
@@ -29,8 +30,23 @@ services:
     volumes: ["./keycloak/setup_realm.py:/setup_realm.py:ro"]
     environment:
       KC_URL: http://keycloak:8080
+      WEB_APP_URL: http://localhost:3000
     command: ["python3", "/setup_realm.py"]
     restart: "no"
+
+  web-app:
+    image: python:3.13-alpine
+    restart: unless-stopped
+    depends_on: [keycloak]
+    volumes: ["./web-app/app.py:/app.py:ro"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      WEB_APP_URL: http://localhost:3000
+      KC_PUBLIC_URL: http://localhost:8080
+      KC_URL: http://keycloak:8080
+      SERVICE_1_URL: http://service-1:8081/
+    command: ["python3", "/app.py"]
+    ports: ["3000:3000"]
 
   service-1:
     <<: *service
@@ -59,23 +75,3 @@ services:
       <<: *service-env
       SERVICE_NAME: service-3
       PORT: "8083"
-      NEXT_SERVICE_URL: http://service-4:8084/
-      NEXT_CLIENT_ID: service-4
-
-  service-4:
-    <<: *service
-    ports: ["8084:8084"]
-    environment:
-      <<: *service-env
-      SERVICE_NAME: service-4
-      PORT: "8084"
-
-  demo:
-    image: python:3.13-alpine
-    profiles: ["demo"]
-    volumes: ["./demo.py:/demo.py:ro"]
-    environment:
-      KC_URL: http://keycloak:8080
-      SERVICE_1_URL: http://service-1:8081/
-      SERVICE_3_URL: http://service-3:8083/
-    command: ["python3", "/demo.py"]

@@ -1,146 +1,118 @@
-# RFC 8693 delegation chain on Keycloak 26.8.1 (POC)
+# RFC 8693 delegation on stock Keycloak 26.8.1 (POC, no customization)
+
+The POC uses the stock Keycloak image or distribution with **no extensions and no custom scopes**. It
+only needs two built-in features turned on and some admin configuration.
 
 ```
-alice ──► service-1 ──► service-2 ──► service-3 ──► service-4
+browser ──login──► Keycloak ──token──► web page ──► service-1 ──token exchange──► service-2
 ```
 
-At every hop the calling service exchanges the token it received for a new one meant only for the next
-service (RFC 8693 token exchange). Every token keeps:
-
-* `sub` = **alice**, the original user, never a service
-* `act` = the **full delegation chain**, most recent actor first, with earlier actors nested (RFC 8693 §4.1)
-
-The token that service-4 receives:
+1. Open the web page (http://localhost:3000). It redirects you to the **Keycloak login page**.
+2. Keycloak shows a consent screen: **"Allow service-1 to act on your behalf?"**. Click **Yes**.
+3. You land back on the page. The initial token (issued to `web-app`) has `sub=alice` and
+   `may_act={client_id: service-1}`.
+4. Click **Call service-1 → service-2**. service-1 exchanges alice's token
+   (RFC 8693: `subject_token` + `actor_token`) for a new token for service-2:
 
 ```json
 {
   "sub": "<alice-id>", "preferred_username": "alice",
-  "azp": "service-3",
-  "aud": "service-4",
-  "may_act": { "client_id": "service-4", "sub": "<service-4 service-account id>" },
-  "act": {
-    "client_id": "service-3", "sub": "...",
-    "act": {
-      "client_id": "service-2", "sub": "...",
-      "act": { "client_id": "service-1", "sub": "..." }
-    }
-  }
+  "azp": "service-1",
+  "aud": "service-2",
+  "act": { "client_id": "service-1", "sub": "<service-1 service-account id>" }
 }
 ```
 
-service-4 reads this as `alice -> service-1 -> service-2 -> service-3 -> service-4`.
+service-2 knows the **user is alice** (`sub`) and that **service-1 is calling on her behalf** (`act`).
 
 ## Run it
 
-**Docker:**
+**Docker** (stock `quay.io/keycloak/keycloak:26.8.1`):
 
 ```bash
-docker compose up -d --build                # Keycloak, realm setup, service-1..4
-docker compose logs -f keycloak-setup       # wait for "done."
-python3 demo.py                             # or: docker compose --profile demo run --rm demo
+docker compose up -d
+docker compose logs -f keycloak-setup     # wait for "done."
+# open http://localhost:3000 and log in as alice / alice
 ```
 
-**Without Docker** (needs Java 21, Maven, Python 3; downloads the Keycloak distribution):
+**Without Docker** (needs Java 21 and Python 3; downloads the stock Keycloak distribution):
 
 ```bash
-./run-local.sh          # starts everything and runs the demo
+./run-local.sh            # then open http://localhost:3000 (alice / alice)
 ./run-local.sh stop
 ```
 
-`demo.py` logs alice in, calls service-1, prints each hop's view of the token and runs 8 checks. 5 check
-the happy path. 3 are negative checks:
+**Optional automated browser test** (needs `pip install playwright && playwright install chromium`):
 
-| Check | Result |
-|---|---|
-| service-3 called directly with alice's service-1 token | rejected (token isn't addressed to service-3) |
-| service-3 tries to exchange a token whose `may_act` names service-2 | `400 Actor user is not allowed by the may_act claim` |
-| service-1 tries to reuse the token it already delegated to service-2 | `400 Actor user is not allowed by the may_act claim` |
+```bash
+python3 tests/e2e_browser.py
+```
+
+It logs in through the real Keycloak pages, consents, clicks both buttons, and checks 8 things.
 
 Admin console: http://localhost:8080/admin (admin/admin), realm `rfc8693`.
 
-## How it works
+## What is configured (all built in)
 
-### Keycloak features used (26.8.1)
-
-| Piece | What it does |
+| Keycloak piece | Purpose |
 |---|---|
-| **Standard Token Exchange V2** (default on). Client attribute `standard.token.exchange.enabled=true` | Internal-to-internal RFC 8693 exchange |
-| **`token-exchange-delegation`** (preview) + **`parameterized-scopes`** (preview) | Exchange with an `actor_token`. Keycloak checks the subject token's `may_act` against the actor and issues `act` |
-| **Parameterized scope type `client-delegation`** | Requesting `delegate-to:<client>` adds `may_act={sub,client_id}` and `aud=<client>` to the issued token |
-| **Fine-Grained Admin Permissions v2**: `delegate` permission on Users | Decides which clients may be named in `delegate-to:<client>`, i.e. who may act for users |
-| **`delegation-chain` provider** (this repo, ~60 lines) | Nests the previous chain into `act` (see below) |
+| Feature `token-exchange-delegation` (preview) + `parameterized-scopes` (preview) | Lets token exchange take an `actor_token`. Keycloak checks the subject token's `may_act` against the actor and writes `act` into the new token |
+| Built-in client scope `delegation:client` (optional scope on `web-app`) | Requesting `delegation:client:service-1` at login shows the consent screen. It adds `may_act` and `aud=service-1` to alice's token |
+| `web-app` client: confidential, authorization code + PKCE, **consent required** | The web page. The delegation scope is "always consent", so alice approves it herself on every login |
+| `service-N` clients: service account + `standard.token.exchange.enabled` | The service account gives each service its own `actor_token` |
+| Client scope `audience-service-2` (standard audience mapper) on service-1 | Lets service-1 request a token whose audience is service-2 |
+| Fine-Grained Admin Permissions v2: `delegate` on Users, for service-1 | Decides which clients may be named in `delegation:client:<client>`. Without it, login with that scope is refused |
 
-### One hop (service-N → service-N+1)
+All of this is set by `keycloak/setup_realm.py` through the admin REST API.
+
+### The exchange service-1 performs
 
 ```
 POST /realms/rfc8693/protocol/openid-connect/token
   grant_type         = urn:ietf:params:oauth:grant-type:token-exchange
-  client_id/secret   = service-N
-  subject_token      = <token service-N received>   (its may_act must name service-N)
+  client_id/secret   = service-1
+  subject_token      = alice's token (may_act must name service-1)
   subject_token_type = urn:ietf:params:oauth:token-type:access_token
-  actor_token        = <service-N's own client_credentials token>
+  actor_token        = service-1's own client_credentials token
   actor_token_type   = urn:ietf:params:oauth:token-type:access_token
-  scope              = delegate-to:service-N+1
+  audience           = service-2
 ```
 
-Keycloak checks the following:
-1. The subject token is valid and addressed to service-N.
-2. The actor token belongs to service-N.
-3. The subject token's `may_act` names service-N.
-4. service-N+1 holds the FGAP `delegate` permission.
+## What stock Keycloak 26.8.1 does **not** do (yet)
 
-It then issues a token with `sub=alice`, `aud=service-N+1`, `may_act=service-N+1`, and
-`act={service-N, act:<previous chain>}`. See `services/service.py` for the client side (~20 lines).
+The second button, **"Try one more hop: service-2 → service-3"**, shows where stock Keycloak stops.
 
-The first hop is alice logging in to `web-app` with `scope=openid delegate-to:service-1`. Her token is
-addressed to service-1 and allows service-1 to act for her. She calls service-1 directly, so this token
-has no `act`.
+* **Only one delegated hop.** The token service-2 receives has `act` but no `may_act` for the next hop, so
+  service-2 cannot do another delegation exchange. A standard exchange (without `actor_token`) is refused
+  too. The page shows Keycloak's error:
+  `Subject token with a delegation claim is not allowed for standard token exchange`.
+  * A `may_act` for the next hop could only come from requesting `delegation:client:service-3` during the
+    exchange. That scope is "always consent", and consent can only be given in a browser login, never
+    inside a token-exchange request. Keycloak rejects it.
+* **No nested `act` chain.** Even with a further hop, Keycloak builds `act` from the subject token's
+  `may_act` plus the **actor** token's `act`. It does not carry over the subject token's `act`, so the
+  earlier hops would be lost.
 
-### Why two things are custom
-
-1. **`delegate-to` scope instead of the built-in `delegation:client` scope.** When the feature is on,
-   Keycloak creates `delegation:client`, but marks it *always consent*. Consent can only be given in an
-   interactive browser login, never during a token-exchange request. So the built-in scope only works for
-   the first, user-facing hop. `setup_realm.py` clones it as `delegate-to`, with the same type and mappers
-   but no always-consent, so services can use it for later hops. The FGAP `delegate` permission still
-   controls who may be delegated to.
-   *Production option:* keep `delegation:client` (with a consent screen) on the user-facing client, and use
-   `delegate-to` only between services.
-
-2. **`keycloak/delegation-chain-provider`.** The built-in delegation provider sets
-   `act = may_act(subject_token)`, and only nests the `act` from the **actor** token. In a service chain
-   the history is in the **subject** token, so it would be lost after one hop: service-4 would only see
-   `act={service-3}`. The provider extends Keycloak's `TokenExchangeDelegationProvider` and changes only
-   one thing: it appends the subject token's `act` as the innermost nested `act`. All validation is
-   inherited. It is registered with a higher `order()` (20 vs 15), so Keycloak picks it for requests that
-   carry an `actor_token`. Keycloak logs a warning at startup that this SPI is internal.
+Getting `user → s1 → s2 → s3 → s4` with a nested `act` chain needs the two customizations on branch
+`claude/keycloak-rfc8693-poc`: a non-consent copy of the delegation scope, and a small token-exchange
+provider. Otherwise, wait for Keycloak to support this natively.
 
 ## Layout
 
 ```
-keycloak/
-  Dockerfile                       Keycloak 26.8.1 + features + provider
-  setup_realm.py                   realm, user, clients, delegate-to scope, FGAP permission (admin REST API)
-  delegation-chain-provider/       Java SPI: keeps the nested act chain
-services/service.py                generic service (validate → exchange → call next); run 4 times
-demo.py                            end-to-end demo + checks
-run-local.sh                       no-Docker runner
-docker-compose.yml
+keycloak/setup_realm.py   realm, user, clients, scopes, FGAP permission (admin REST API, stdlib Python)
+web-app/app.py            the web page: OIDC code flow + PKCE, server-side session, calls service-1
+services/service.py       generic service: validate (introspection) -> token exchange -> call next
+tests/e2e_browser.py      optional Playwright test of the whole browser flow
+run-local.sh              no-Docker runner
+docker-compose.yml        stock Keycloak image + setup + web-app + service-1..3
 ```
 
-## Things to know / production notes
+## Notes
 
-* **Preview features.** `token-exchange-delegation` and `parameterized-scopes` are preview in 26.8 and may
-  change. The provider uses an internal SPI, so re-test it on every Keycloak upgrade (it is pinned to
-  26.8.1 in `pom.xml` and the `Dockerfile`).
-* **Restricting who can delegate to whom.** The POC grants `delegate` to all four services for all users.
-  Make it stricter with per-client policies or per-user/group resources in FGAP. Also give each service
-  only the `delegate-to` scope it needs: the scope is optional on every client here, so service-1 could
-  technically request `delegate-to:service-4`.
-* **Tokens from token exchange** are access tokens only (no refresh token), backed by a transient session.
-  The chain is valid only while alice's original SSO session is alive.
-* **`web-app` uses the password grant** only to keep the demo scriptable. Use authorization code + PKCE in
-  real life.
-* **Validation in the services.** Services validate tokens by introspection, which preserves `act`. Local
-  JWT validation through JWKS works too: check `aud` contains yourself, then read `sub` and `act`.
-* **Secrets** are `<client-id>-secret`, and the admin login is admin/admin. Demo only.
+* `token-exchange-delegation` and `parameterized-scopes` are **preview** features in 26.8 and may change.
+* Token-exchange tokens are access tokens only, with no refresh token. They are valid only while alice's
+  login session is alive.
+* Services validate tokens by introspection, which returns `act` and `may_act`. Local JWT validation
+  through JWKS works the same way: check `aud`, then read `sub` and `act`.
+* Client secrets are `<client-id>-secret` and admin is admin/admin. Demo only.
