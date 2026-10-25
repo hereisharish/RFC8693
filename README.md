@@ -173,8 +173,14 @@ docker-compose.yml
   Make it stricter with per-client policies or per-user/group resources in FGAP. Also give each service
   only the `delegate-to` scope it needs: the scope is optional on every client here, so service-1 could
   technically request `delegate-to:service-4`.
-* **Tokens from token exchange** are access tokens only (no refresh token), backed by a transient session.
-  The chain is valid only while alice's original SSO session is alive.
+* **Tokens from token exchange** are access tokens only — the response has no `refresh_token`, just
+  `access_token`, `expires_in`, `issued_token_type` and `scope`.
+* **Revoking the user does not revoke delegated tokens.** Each exchanged token gets its own transient
+  session, which is *not* terminated with the user's. Measured: after `POST /logout` the original user
+  token introspects `active: false`, while a token exchanged from it stays `active: true` — and still does
+  after an admin `POST /users/{id}/logout` of every session that user has. A delegated token therefore
+  lives until it expires (`accessTokenLifespan`, 1800s here). Keep that lifespan short if you need
+  revocation to mean anything, and do not assume logout stops work already delegated downstream.
 * **The portal keeps alice's token in the browser**, deliberately: the whole point of the demo is to put
   the real token on screen. In production, prefer a BFF — the server handles the callback, keeps the token
   in a session, and proxies the call to service-1 — so a delegation token never reaches the browser at all.
