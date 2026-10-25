@@ -14,9 +14,11 @@ Env: SERVICE_NAME, CLIENT_SECRET, PORT, KC_URL, REALM, NEXT_SERVICE_URL, NEXT_CL
 import base64
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NAME = os.environ["SERVICE_NAME"]
@@ -28,6 +30,11 @@ NEXT_URL = os.environ.get("NEXT_SERVICE_URL")
 NEXT_CLIENT = os.environ.get("NEXT_CLIENT_ID")
 TITLE = os.environ.get("SERVICE_TITLE", NAME)       # business label shown in the UI
 DATA = os.environ.get("SERVICE_DATA")               # JSON payload this service owns (the last hop's answer)
+# The only actor allowed to call this service on a user's behalf, i.e. the approved predecessor in the
+# chain. Unset means "no restriction" (service-1 is called by the user directly, so it stays unset).
+ALLOWED_CALLER = os.environ.get("ALLOWED_CALLER")
+
+AUDIT = deque(maxlen=200)  # what this service actually saw; served at GET /audit
 
 OIDC = f"{KC_URL}/realms/{REALM}/protocol/openid-connect"
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -84,6 +91,25 @@ def jwt_claims(token):
     return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
 
 
+def record(decision, reason, user=None, sub=None, chain=None, token_id=None):
+    """One audit line per request this service handled, allowed or refused."""
+    entry = {
+        # epoch millis so the consolidated report can render every source in one timezone; containers
+        # run UTC while Keycloak's event log is read in local time.
+        "ts": int(time.time() * 1000),
+        "service": NAME, "title": TITLE,
+        "decision": decision, "reason": reason,
+        "user": user, "sub": sub,
+        "called_by": (chain[0] if chain else user),
+        "delegation_chain": list(reversed(chain)) if chain else [],
+        "token_id": token_id,
+    }
+    AUDIT.append(entry)
+    print(f"[{NAME}] AUDIT {decision.upper():6} {reason:34} user={user} "
+          f"called_by={entry['called_by']} chain={'->'.join(entry['delegation_chain']) or '-'}", flush=True)
+    return entry
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -111,24 +137,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") == "/audit":
+            return self.reply(200, {"service": NAME, "title": TITLE,
+                                    "approved_caller": ALLOWED_CALLER, "entries": list(AUDIT)})
+
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
+            record("deny", "no bearer token")
             return self.reply(401, {"service": NAME, "error": "missing bearer token"})
         token = auth[7:]
 
         info = introspect(token)
         aud = info.get("aud") or []
         aud = [aud] if isinstance(aud, str) else aud
-        if not info.get("active"):
-            return self.reply(401, {"service": NAME, "error": "token not active"})
-        if NAME not in aud:
-            return self.reply(403, {"service": NAME, "error": f"token audience {aud} does not include {NAME}"})
-
         user = info.get("preferred_username") or info.get("sub")
         chain = actors(info.get("act"))
+        tid = info.get("jti")
+
+        if not info.get("active"):
+            # Introspection reports inactive when this client is not in the token's audience, so a
+            # token addressed elsewhere lands here rather than in the audience check below.
+            record("deny", "token not active for this service", token_id=tid)
+            return self.reply(401, {"service": NAME, "error": "token not active"})
+        if NAME not in aud:
+            record("deny", f"audience {aud} excludes {NAME}", user, info.get("sub"), chain, tid)
+            return self.reply(403, {"service": NAME, "error": f"token audience {aud} does not include {NAME}"})
+
+        # The approved call graph: only the designated predecessor may delegate into this service.
+        # Keycloak blocks disallowed hops at issuance; this refuses them at the door as well, so a
+        # token minted before the rule existed, or by a future misconfiguration, still gets rejected.
+        caller = chain[0] if chain else user
+        if ALLOWED_CALLER and caller != ALLOWED_CALLER:
+            record("deny", f"caller {caller} is not the approved {ALLOWED_CALLER}",
+                   user, info.get("sub"), chain, tid)
+            return self.reply(403, {
+                "service": NAME,
+                "error": f"{NAME} only accepts calls delegated by {ALLOWED_CALLER}, but this token was "
+                         f"delegated by {caller}",
+                "delegation_chain": list(reversed(chain)),
+            })
+
         call_path = [user] + list(reversed(chain)) + [NAME]
-        print(f"[{NAME}] user={user} sub={info.get('sub')} called-by={chain[0] if chain else user} "
-              f"path={' -> '.join(call_path)}", flush=True)
+        record("allow", "validated", user, info.get("sub"), chain, tid)
 
         result = {
             "service": NAME,
@@ -161,5 +211,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"[{NAME}] listening on :{PORT} next={NEXT_URL or '-'}", flush=True)
+    print(f"[{NAME}] listening on :{PORT} next={NEXT_URL or '-'} "
+          f"accepts-delegation-from={ALLOWED_CALLER or 'anyone'}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

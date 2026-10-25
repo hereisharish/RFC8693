@@ -70,9 +70,14 @@ It shows three things an audience can follow:
    there is no `act` yet, because alice is calling service-1 herself.
 2. **Behind the scenes** — one card per hop, showing that `sub` never stops being alice while `act`
    gains one more nested actor each time, and what `aud`/`may_act` each minted token carried.
-3. **Can the token be misused?** — a button that hands alice's token straight to service-3, skipping
-   the chain. It comes back `401 token not active`. The other two attacks need client secrets, so they
-   live in `demo.py` rather than in browser code.
+3. **Can the chain be short-circuited?** — buttons that hand alice's token straight to service-3 or
+   service-4, skipping the hops in between. Both come back `401 token not active`.
+4. **Audit trail** — every request each service handled, with the delegation chain it saw and whether
+   it allowed the call.
+
+The attacks that need client secrets (exchanging a token meant for another service, replaying a token
+already delegated away, minting a token for a service further down the chain) stay out of browser code
+and live in `demo.py`.
 
 The services label themselves Orders API / Billing / Payments / Ledger through `SERVICE_TITLE`; the
 Keycloak client IDs are still `service-1`..`service-4`. service-4 returns the account data via
@@ -84,14 +89,89 @@ Keycloak client IDs are still `service-1`..`service-4`. service-4 returns the ac
 python3 demo.py                             # or: docker compose --profile demo run --rm demo
 ```
 
-`demo.py` logs alice in, calls service-1, prints each hop's view of the token and runs 8 checks. 5 check
-the happy path. 3 are negative checks:
+`demo.py` logs alice in, calls service-1, prints each hop's view of the token and runs 13 checks. 5 check
+the happy path. The rest are negative checks:
 
 | Check | Result |
 |---|---|
 | service-3 called directly with alice's service-1 token | `401 token not active` (introspection by service-3 reports `active: false`, because the token's `aud` is service-1) |
 | service-3 tries to exchange a token whose `may_act` names service-2 | `400 Actor user is not allowed by the may_act claim` |
 | service-1 tries to reuse the token it already delegated to service-2 | `400 Actor user is not allowed by the may_act claim` |
+| service-1 tries to mint a token for service-3 or service-4 (skipping hops) | `400 Delegation from service-1 to service-3 is not an approved hop` |
+| service-2 tries to mint a token for service-4 | `400 Delegation from service-2 to service-4 is not an approved hop` |
+| service-4 called directly with alice's token | `401 token not active` |
+
+## The approved call graph
+
+The chain is `1 -> 2 -> 3 -> 4`, and only those hops are allowed. This is enforced twice, independently:
+
+**At issuance, by Keycloak.** `DELEGATION_ALLOWED_HOPS` on the Keycloak container lists the approved
+pairs; the `delegation-chain` provider refuses anything else, so service-1 cannot even *obtain* a token
+for service-4:
+
+```
+DELEGATION_ALLOWED_HOPS=service-1>service-2,service-2>service-3,service-3>service-4
+```
+
+```
+service-1 -> service-2   token issued
+service-1 -> service-3   400 Delegation from service-1 to service-3 is not an approved hop
+service-1 -> service-4   400 Delegation from service-1 to service-4 is not an approved hop
+service-2 -> service-4   400 Delegation from service-2 to service-4 is not an approved hop
+service-3 -> service-4   token issued
+```
+
+Each refusal is written to the Keycloak event log as a `TOKEN_EXCHANGE_ERROR` with
+`error=delegation_hop_not_allowed` and `details.rejected_hop=service-1>service-4`.
+
+**At the door, by the service.** Each service has `ALLOWED_CALLER` set to its approved predecessor and
+checks the innermost `act.client_id` of the token it was handed, refusing anything else with a 403. This
+is defense in depth: it still rejects a token minted before the rule existed, or one produced by a
+future misconfiguration.
+
+Note that this is *not* something `act` gives you for free. `act` is a truthful record of the
+delegations that happened; it does not constrain them. Without the two rules above, Keycloak will
+happily mint service-1 a token for service-4 and service-4 will accept it — the FGAP `delegate`
+permission is a global "who may be delegated to" allowlist and cannot express a *pair*. See
+`RFC8693-HANDOFF.md` §5.3 and §5.6.
+
+## The audit picture
+
+```bash
+python3 audit.py              # both halves
+python3 audit.py --issuance   # Keycloak's event log only
+python3 audit.py --use        # what the services recorded only
+```
+
+Two independent records, deliberately kept separate:
+
+1. **Issuance** — Keycloak's own event log. Every exchange is a `TOKEN_EXCHANGE` event carrying
+   `details.actor` (who asked), `details.audience` (which service the token was minted for) and
+   `details.username` (on whose behalf). Refusals are `TOKEN_EXCHANGE_ERROR`. Enabled on the realm by
+   `setup_realm.py`.
+2. **Use** — each service's `GET /audit`: who it saw, which chain delegated the call, and
+   allow/deny with a reason. Every field is derived from the validated token, never from a header or
+   anything the caller asserted.
+
+```
+1. ISSUANCE - Keycloak event log: who was given a token for what, on whose behalf
+  time      event          actor        on behalf of  token minted for  outcome
+  15:20:19  login          web-app      alice         -                 granted
+  15:20:19  exchange       service-1    alice         service-2         granted
+  15:20:19  exchange       service-2    alice         service-3         granted
+  15:20:19  exchange       service-3    alice         service-4         granted
+  15:20:19  exchange       service-1    alice         service-4         REFUSED  delegation_hop_not_allowed (service-1>service-4)
+
+2. USE - what each service saw, and what it allowed or refused
+  time      service                user    called by    delegation chain                     decision
+  15:20:49  Orders API (service-1) alice   alice        -                                    allow
+  15:20:49  Billing (service-2)    alice   service-1    service-1                            allow
+  15:20:49  Payments (service-3)   alice   service-2    service-1 -> service-2               allow
+  15:20:49  Ledger (service-4)     alice   service-3    service-1 -> service-2 -> service-3  allow
+```
+
+The portal shows the service-side half under **Audit trail**. Keycloak's event log needs admin
+credentials, so it stays in `audit.py` rather than in browser code.
 
 ## How it works
 
@@ -157,9 +237,10 @@ keycloak/
   Dockerfile                       Keycloak 26.8.1 + features + provider
   setup_realm.py                   realm, user, clients, delegate-to scope, FGAP permission (admin REST API)
   delegation-chain-provider/       Java SPI: keeps the nested act chain
-services/service.py                generic service (validate → exchange → call next); run 4 times
+services/service.py                generic service (validate → enforce caller → exchange → call next); run 4 times
 ui/index.html                      the portal: auth code + PKCE, one button, renders the whole chain
 demo.py                            end-to-end demo + checks
+audit.py                           consolidated audit: Keycloak issuance log + what each service recorded
 run-local.sh                       no-Docker runner
 docker-compose.yml
 ```

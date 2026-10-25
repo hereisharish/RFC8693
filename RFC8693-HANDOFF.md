@@ -67,7 +67,7 @@ Response (*measured* — exact key set):
   "scope": "...", "refresh_expires_in": 0, "not-before-policy": 0 }
 ```
 
-**There is no `refresh_token`.** *(measured)* Plan for that — see §5.5.
+**There is no `refresh_token`.** *(measured)* Plan for that — see §5.4.
 
 The issued token has `sub` = the user, `aud` = the delegated-to client, `may_act` = the delegated-to
 client, and `act` = service-N wrapped around the subject token's previous `act`.
@@ -417,7 +417,7 @@ Authorization code + PKCE with `scope=openid delegate-to:service-1` yields `aud:
 
 ---
 
-## 5. Five behaviours that will shape your design (all *measured*)
+## 5. Eight behaviours that will shape your design (all *measured*)
 
 These are the results most likely to invalidate assumptions. Read them before designing.
 
@@ -456,7 +456,97 @@ The response has no `refresh_token` (§2). A delegated token simply expires. Lon
 either re-exchange from a still-valid subject token, or hold the *user's* refresh token upstream and mint
 a fresh subject token first.
 
-### 5.5 Revoking the user does **not** revoke delegated tokens
+### 5.5 The FGAP `delegate` permission is a *target* allowlist, and fails silently
+
+Measured, and worth knowing before you design per-tool authorisation: the client policy attached to the
+`delegate` permission lists **who may be delegated to**, not who may ask.
+
+With the policy containing only `service-1`:
+
+```
+user logs in asking delegate-to:service-1  ->  aud=service-1, may_act=service-1   (service-1 is listed)
+user logs in asking delegate-to:service-2  ->  aud=null, may_act=null             (service-2 is not)
+service-1 exchanges for delegate-to:service-2 -> HTTP 200, but aud=null, may_act=null,
+                                                 and "delegate-to:service-2" is dropped from scope
+```
+
+Two consequences:
+
+- **It cannot express a pair.** "service-3 may delegate to service-4 but service-1 may not" is
+  inexpressible, because the permission only knows about service-4 as a target. For per-pair rules you
+  need something else — §5.6.
+- **Denial is silent.** The exchange returns **HTTP 200** with a token that merely has no `aud` and no
+  `may_act`, and the requested scope quietly missing from the `scope` response field. Nothing says
+  "denied". The next hop then fails with the confusing
+  `Invalid may_act claim in the subject_token`, pointing at the wrong place entirely. If a delegation
+  is mysteriously not working, **check whether the target holds the FGAP `delegate` permission** before
+  anything else, and assert on `may_act` being present rather than on the HTTP status.
+
+### 5.6 Enforcing an approved call graph (what this repo does)
+
+Since `act` only records (§5.3) and FGAP only gates targets (§5.5), enforcing "only service-N may
+delegate to service-N+1" needs explicit work. This repo does it in two independent layers:
+
+**Issuance.** `DelegationChainTokenExchangeProvider` reads the delegation target and refuses
+unapproved pairs. The approved graph comes from an env var:
+
+```
+DELEGATION_ALLOWED_HOPS=service-1>service-2,service-2>service-3,service-3>service-4
+```
+
+```java
+// inside checkRequestedAudiences, AFTER super.checkRequestedAudiences(responseBuilder)
+if (!(claims.get("may_act") instanceof Map<?, ?> mayAct)) return;   // not a delegation request
+String targetId = String.valueOf(mayAct.get("client_id"));
+String actor = client.getClientId();
+if (!allowedHops.getOrDefault(actor, Set.of()).contains(targetId)) {
+    event.detail("rejected_hop", actor + ">" + targetId);
+    event.error("delegation_hop_not_allowed");        // without this the refusal is NOT audited
+    throw new CorsErrorResponseException(cors, "invalid_request",
+        "Delegation from " + actor + " to " + targetId + " is not an approved hop",
+        Response.Status.BAD_REQUEST);
+}
+```
+
+Two traps found the hard way:
+
+- **Read the target from `may_act`, not from `getTargetAudienceClients()`.** The latter returns the
+  RFC 8693 `audience` *request parameter*, which defaults to the calling client itself when absent —
+  so every hop evaluates as "service-1 -> service-1" and the whole chain breaks. The delegation target
+  is whoever `may_act` names, which means the check must run **after** `super`, once the claim exists.
+- **Call `event.error(...)` before throwing.** Throwing alone rejects the request but writes **no**
+  `TOKEN_EXCHANGE_ERROR` event — the blocked attempt leaves no audit trace at all.
+
+**At the resource.** Each service also checks the innermost `act.client_id` of the token presented to
+it against its one approved predecessor, and returns 403 otherwise. Cheap, and it still catches tokens
+minted before a rule existed or produced by a misconfiguration.
+
+Result (measured): `service-1 -> service-3`, `service-1 -> service-4` and `service-2 -> service-4` are
+all refused at issuance with `400 ... is not an approved hop`, while the approved hops still work.
+
+### 5.7 What the audit log actually contains
+
+Realm config `eventsEnabled: true` (plus `eventsListeners: ["jboss-logging"]`) turns this on. Every
+exchange then produces a `TOKEN_EXCHANGE` event whose `details` carry exactly the delegation question:
+
+```json
+{ "type": "TOKEN_EXCHANGE", "clientId": "service-1", "userId": "...",
+  "details": { "actor": "service-1", "actor_id": "...", "actor_type": "client",
+               "audience": "service-2", "username": "alice",
+               "subject_token_client_id": "web-app",
+               "scope": "delegate-to:service-2 profile email",
+               "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange" } }
+```
+
+`actor` = who asked, `audience` = which service the token was minted for, `username` = on whose behalf.
+Refusals arrive as `TOKEN_EXCHANGE_ERROR` with an `error` field. Read them from
+`GET /admin/realms/{realm}/events?type=TOKEN_EXCHANGE` with an admin token.
+
+For an agent system this is the record that answers "which agent obtained access to which tool, for
+which user, and when" — without trusting anything the agent reported about itself. Pair it with a
+resource-side log (what each tool actually saw in the token it validated) and you have both halves.
+
+### 5.8 Revoking the user does **not** revoke delegated tokens
 
 This is the sharpest finding, and it contradicts a natural assumption.
 
@@ -575,15 +665,19 @@ precisely what the custom provider in §3.6 exists to preserve.
 
 Two independent levers, use both:
 
-- **FGAP `delegate` permission** — which clients may act for which users at all (§3.5). Make this
-  per-tool rather than the blanket grant the reference uses.
+- **FGAP `delegate` permission** — a global allowlist of *which clients may be delegated to at all*
+  (§3.5, semantics in §5.5). Make this per-tool rather than the blanket grant the reference uses. It
+  cannot express "the orchestrator may call tool X but tool X may not call tool Y" — for that, see below.
+- **An approved call graph** (§5.6) — if your tools must not call each other arbitrarily, enforce the
+  permitted (caller, target) pairs explicitly: at issuance in the exchange provider, and again at each
+  tool by checking `act.client_id`. Do not expect `act` or FGAP to do this for you (§5.3, §5.5).
 - **Optional client scope assignment** — only assign `delegate-to` to clients that legitimately need it.
-  In the reference it is assigned to everything, which means service-1 could request
-  `delegate-to:service-4`; see §5.3 for why that matters.
+  Note this is coarse: `delegate-to` is one parameterized scope covering every target, so removing it
+  stops a client delegating *at all*, not delegating to a particular tool.
 
 ### 7.5 Long-running and background agents
 
-§5.5 means delegated tokens outlive the user's session, so a background agent keeps working after the
+§5.8 means delegated tokens outlive the user's session, so a background agent keeps working after the
 user disconnects. Decide deliberately whether you want that.
 
 If an agent must run longer than `accessTokenLifespan`, the delegated token cannot be refreshed (§5.4).
@@ -626,9 +720,12 @@ Work top to bottom; each step depends on the ones above it.
    orchestrator. If not, the scope request or §3.4 is wrong — stop here, nothing downstream can work.
 7. **Can the orchestrator get its own `client_credentials` token?** That is the `actor_token`.
 8. **Does one exchange succeed?** Run §2 by hand with curl before any application code. The error strings
-   in §4.2 and §6 tell you which check failed.
-9. **Is `act` nesting past one hop?** If not, §6.3 — the custom provider is not loaded.
-10. **Browser-specific failures** → §6.1 and §6.5.
+   in §4.2 and §6 tell you which check failed. Assert that the issued token actually has `aud` and
+   `may_act` — a denied target returns HTTP 200 with both missing rather than an error (§5.5).
+9. **If you added an approved call graph** (§5.6), confirm the permitted hops still succeed, not only
+   that the forbidden ones fail.
+10. **Is `act` nesting past one hop?** If not, §6.3 — the custom provider is not loaded.
+11. **Browser-specific failures** → §6.1 and §6.5.
 
 ### A decoder, for reading tokens while debugging
 
@@ -650,8 +747,7 @@ decode "$TOKEN" | jq -r '[.preferred_username // .sub]
 
 ## 9. Deliberately not solved here
 
-- **Enforcing a required call path.** `act` records, it does not enforce (§5.3).
-- **Revocation that actually bites.** §5.5; short lifespans plus your own check at the tool boundary.
+- **Revocation that actually bites.** §5.8; short lifespans plus your own check at the tool boundary.
 - **Agents outliving token expiry.** §7.5, untested.
 - **Keeping the delegation token out of the browser.** The reference puts it in the browser on purpose,
   to make it visible during a demo. Production shape is a BFF: the server handles the OIDC callback,

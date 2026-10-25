@@ -108,5 +108,35 @@ s2_status, err2 = post({"grant_type": "urn:ietf:params:oauth:grant-type:token-ex
 results.append(check(f"service-1 cannot re-use the service-2 token (HTTP {s2_status}: {err2.get('error_description')})",
                      s2_status in (400, 403)))
 
+# 5. The approved call graph: only service-N may delegate to service-N+1. Skipping a hop must fail at
+#    issuance, so a service cannot even obtain a token for a service it is not allowed to call.
+banner("5. Approved call graph (1 -> 2 -> 3 -> 4 only)")
+
+
+def exchange_as(caller, subject_token, target):
+    creds = {"client_id": caller, "client_secret": f"{caller}-secret"}
+    actor = post({"grant_type": "client_credentials", **creds})[1]["access_token"]
+    return post({"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange", **creds,
+                 "subject_token": subject_token, "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                 "actor_token": actor, "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                 "scope": f"delegate-to:{target}"})
+
+
+for caller, target in (("service-1", "service-3"), ("service-1", "service-4"), ("service-2", "service-4")):
+    subject = user_token if caller == "service-1" else t12["access_token"]
+    st, body = exchange_as(caller, subject, target)
+    blocked = st in (400, 403) and "not an approved hop" in (body.get("error_description") or "")
+    results.append(check(f"{caller} cannot mint a token for {target} (HTTP {st}: {body.get('error_description')})",
+                         blocked))
+
+# the approved hops must still work, or the rule is simply breaking everything
+st, body = exchange_as("service-1", user_token, "service-2")
+results.append(check("service-1 -> service-2 is still allowed (the approved hop)", st == 200))
+
+# and even with a token in hand, service-4 refuses a caller that is not service-3
+status, body = get(os.environ.get("SERVICE_4_URL", "http://localhost:8084/"), user_token)
+results.append(check(f"service-4 refuses alice's token presented directly (HTTP {status}: {body.get('error')})",
+                     status in (401, 403)))
+
 print(f"\n{sum(results)}/{len(results)} checks passed")
 sys.exit(0 if all(results) else 1)

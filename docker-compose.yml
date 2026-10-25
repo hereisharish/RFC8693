@@ -22,6 +22,9 @@ services:
       # host (localhost:8080) or from inside the compose network (keycloak:8080).
       KC_HOSTNAME: http://localhost:8080
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      # The approved call graph, enforced by the delegation-chain provider at issuance time.
+      # Anything not listed here cannot get a token at all, so service-1 cannot mint one for service-4.
+      DELEGATION_ALLOWED_HOPS: service-1>service-2,service-2>service-3,service-3>service-4
     ports: ["8080:8080"]
 
   keycloak-setup:
@@ -59,6 +62,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: service-2
+      ALLOWED_CALLER: service-1
       SERVICE_TITLE: Billing
       PORT: "8082"
       NEXT_SERVICE_URL: http://service-3:8083/
@@ -70,6 +74,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: service-3
+      ALLOWED_CALLER: service-2
       SERVICE_TITLE: Payments
       PORT: "8083"
       NEXT_SERVICE_URL: http://service-4:8084/
@@ -82,6 +87,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: service-4
+      ALLOWED_CALLER: service-3
       SERVICE_TITLE: Ledger
       PORT: "8084"
       SERVICE_DATA: >-

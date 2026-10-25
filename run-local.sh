@@ -28,6 +28,7 @@ cp keycloak/delegation-chain-provider/target/delegation-chain-provider.jar "$KC_
 echo "starting Keycloak (log: $WORK/keycloak.log) ..."
 KC_BOOTSTRAP_ADMIN_USERNAME=admin KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
 KC_FEATURES=token-exchange-delegation,parameterized-scopes \
+DELEGATION_ALLOWED_HOPS='service-1>service-2,service-2>service-3,service-3>service-4' \
   nohup "$KC_HOME/bin/kc.sh" start-dev --http-port=8080 > "$WORK/keycloak.log" 2>&1 &
 echo $! > "$WORK/keycloak.pid"
 until curl -sf http://localhost:8080/realms/master > /dev/null; do sleep 2; done
@@ -51,6 +52,8 @@ for i in 1 2 3 4; do
     unset NEXT_SERVICE_URL NEXT_CLIENT_ID
     export SERVICE_DATA="$LEDGER"   # the last hop owns the data the portal shows
   fi
+  # services 2..4 only accept calls delegated by their approved predecessor
+  if (( i > 1 )); then export ALLOWED_CALLER="service-$((i - 1))"; else unset ALLOWED_CALLER; fi
   SERVICE_NAME="service-$i" SERVICE_TITLE="${TITLES[i-1]}" PORT="808$i" \
     nohup python3 services/service.py > "$WORK/service-$i.log" 2>&1 &
   echo $! > "$WORK/service-$i.pid"

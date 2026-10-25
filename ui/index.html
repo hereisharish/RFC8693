@@ -161,6 +161,14 @@ const CONFIG = {
   scope:    "openid delegate-to:service-1",
   service1: "http://localhost:8081/",
   service3: "http://localhost:8083/",
+  service4: "http://localhost:8084/",
+  // every service exposes GET /audit: what it saw and what it decided
+  services: [
+    { id: "service-1", url: "http://localhost:8081/" },
+    { id: "service-2", url: "http://localhost:8082/" },
+    { id: "service-3", url: "http://localhost:8083/" },
+    { id: "service-4", url: "http://localhost:8084/" },
+  ],
 };
 const OIDC     = `${CONFIG.kc}/realms/${CONFIG.realm}/protocol/openid-connect`;
 const REDIRECT = location.origin + location.pathname;
@@ -369,21 +377,37 @@ function renderChain(root) {
   });
   html += `</div></div>`;
 
-  /* negative check */
+  /* negative checks: skipping the chain */
   html += `
     <div class="panel">
-      <h2>Can the token be misused?</h2>
+      <h2>Can the chain be short-circuited?</h2>
       <p class="note" style="margin-top:0">
-        Your token is addressed to service-1. Try handing that same token straight to
-        <b>Payments (service-3)</b>, skipping the chain.
+        Your token is addressed to service-1 only. Try handing it straight to a service further down,
+        skipping the hops in between.
       </p>
-      <p><button class="ghost" id="attack">Call Payments directly with my token</button></p>
+      <p>
+        <button class="ghost" data-attack="${esc(CONFIG.service3)}" data-label="Payments (service-3)">
+          Call Payments directly</button>
+        <button class="ghost" data-attack="${esc(CONFIG.service4)}" data-label="Ledger (service-4)">
+          Call Ledger directly</button>
+      </p>
       <div id="attack-out"></div>
       <p class="note">
-        The two other attacks — a service exchanging a token meant for a different service, and a service
-        replaying a token it already delegated away — need client secrets, so they stay out of this page.
-        <code>python3 demo.py</code> runs all three.
+        Skipping is also blocked one level earlier, at token issuance: service-1 cannot even obtain a
+        token for service-3 or service-4. That check needs client secrets, so it lives in
+        <code>python3 demo.py</code> rather than in browser code.
       </p>
+    </div>
+
+    <div class="panel">
+      <h2>Audit trail</h2>
+      <p class="note" style="margin-top:0">
+        What each service recorded: who it saw, who delegated the call, and whether it allowed it.
+        Keycloak's own issuance log — every token minted, for which service, on whose behalf —
+        needs admin credentials, so it is shown by <code>python3 audit.py</code>.
+      </p>
+      <p><button class="ghost" id="load-audit">Load audit trail</button></p>
+      <div id="audit-out"></div>
     </div>
 
     <details>
@@ -392,33 +416,81 @@ function renderChain(root) {
     </details>`;
 
   $("result").innerHTML = html;
-  $("attack").addEventListener("click", attack);
+  document.querySelectorAll("[data-attack]").forEach(b => b.addEventListener("click", attack));
+  $("load-audit").addEventListener("click", loadAudit);
 }
 
 async function attack(e) {
+  const btn = e.target;
+  const url = btn.dataset.attack, label = btn.dataset.label;
   const out = $("attack-out");
-  e.target.disabled = true;
-  out.innerHTML = `<p class="note">Calling service-3 …</p>`;
+  btn.disabled = true;
+  out.innerHTML = `<p class="note">Calling ${esc(label)} …</p>`;
   // Deliberately no refresh-and-retry here: a 401 is the result we want to see.
   let status, body;
   try {
-    const r = await fetch(CONFIG.service3, { headers: { Authorization: `Bearer ${tokens.access}` } });
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${tokens.access}` } });
     status = r.status;
     body = await r.text();
   } catch (err) {
     out.innerHTML = `<p class="fail">Request failed: ${esc(err.message)}</p>`;
-    e.target.disabled = false;
+    btn.disabled = false;
     return;
   }
   const rejected = status === 401 || status === 403;
   out.innerHTML = `
     <p class="${rejected ? "ok" : "fail"}">
-      ${rejected ? `Rejected with HTTP ${status} — as it should be.` : `Unexpected: HTTP ${status}`}
+      ${esc(label)}: ${rejected ? `rejected with HTTP ${status} — as it should be.`
+                                : `UNEXPECTED — HTTP ${status}`}
     </p>
     <pre>${esc(body)}</pre>
-    ${rejected ? `<p class="note">service-3 introspected the token, saw it was not issued for it,
-      and refused. Nothing in the chain can be short-circuited.</p>` : ""}`;
-  e.target.disabled = false;
+    ${rejected ? `<p class="note">It introspected the token, saw it was not issued for it, and refused.
+      The chain cannot be entered halfway.</p>` : ""}`;
+  btn.disabled = false;
+}
+
+async function loadAudit(e) {
+  const btn = e.target, out = $("audit-out");
+  btn.disabled = true;
+  out.innerHTML = `<p class="note">Reading each service's audit log …</p>`;
+
+  const reports = await Promise.all(CONFIG.services.map(async s => {
+    try { return await (await fetch(`${s.url.replace(/\/$/, "")}/audit`)).json(); }
+    catch { return { service: s.id, unreachable: true, entries: [] }; }
+  }));
+
+  const rows = reports.flatMap(r => (r.entries || []).map(x => x)).sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  const fmt = ts => new Date(ts || 0).toLocaleTimeString();
+
+  const graph = reports.map(r => `<tr><td>${esc(r.title || r.service)} <small>${esc(r.service)}</small></td>
+      <td>${r.unreachable ? "<span class='fail'>unreachable</span>"
+        : r.approved_caller ? `only accepts delegation from <b>${esc(r.approved_caller)}</b>`
+                            : "called directly by the user"}</td></tr>`).join("");
+
+  const body = rows.length ? rows.map(x => `
+      <tr>
+        <td>${esc(fmt(x.ts))}</td>
+        <td>${esc(x.title || x.service)}</td>
+        <td>${esc(x.user || "—")}</td>
+        <td>${esc(x.called_by || "—")}</td>
+        <td class="path">${esc((x.delegation_chain || []).join(" → ") || "—")}</td>
+        <td class="${x.decision === "allow" ? "ok" : "fail"}">
+          ${x.decision === "allow" ? "allow" : "DENY — " + esc(x.reason || "")}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="6" class="note">No requests recorded yet.</td></tr>`;
+
+  const denied = rows.filter(x => x.decision !== "allow").length;
+  out.innerHTML = `
+    <table style="margin-bottom:18px">
+      <thead><tr><th>Time</th><th>Service</th><th>User</th><th>Delegated by</th>
+                 <th>Delegation chain</th><th>Decision</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+    <p class="note">${rows.length} requests recorded — ${rows.length - denied} allowed, ${denied} refused.
+       Every row was derived from the token the service validated, not from anything the caller asserted.</p>
+    <h2 style="margin-top:22px">Approved call graph</h2>
+    <table><tbody>${graph}</tbody></table>`;
+  btn.disabled = false;
 }
 
 /* ---------- the button that starts the chain ---------- */
@@ -435,7 +507,14 @@ async function loadSummary(e) {
     }
     const body = await r.json().catch(() => null);
     if (r.status === 401) {
-      showError("Your session expired. Sign out and sign in again to continue.");
+      // The session is gone (expired, or the realm was rebuilt). Drop the stored tokens rather than
+      // keeping them: a stale id_token later fails sign-out with "Invalid parameter: id_token_hint".
+      sessionStorage.clear();
+      $("app").classList.add("hidden");
+      $("anon").classList.remove("hidden");
+      $("signout").classList.add("hidden");
+      $("who").textContent = "";
+      showError("Your session has ended. Sign in again to continue.");
       return;
     }
     if (!r.ok) {

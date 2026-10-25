@@ -73,6 +73,18 @@ def main():
     })
     print(f"realm '{REALM}' created")
 
+    # 1b. Event auditing. TOKEN_EXCHANGE events are the issuance record behind every hop: each one
+    #     carries details.actor (who asked), details.audience (which service the token is for) and
+    #     details.username (on behalf of whom). TOKEN_EXCHANGE_ERROR records the refusals.
+    http("PUT", f"{a}/events/config", t, {
+        "eventsEnabled": True,
+        "eventsExpiration": 7200,
+        "eventsListeners": ["jboss-logging"],
+        "adminEventsEnabled": True,
+        "adminEventsDetailsEnabled": False,
+    })
+    print("event auditing enabled (login, token exchange, and their errors)")
+
     # 2. End user
     http("POST", f"{a}/users", t, {
         "username": USER, "enabled": True, "email": "alice@example.com", "emailVerified": True,
