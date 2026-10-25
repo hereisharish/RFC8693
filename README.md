@@ -35,16 +35,53 @@ service-4 reads this as `alice -> service-1 -> service-2 -> service-3 -> service
 **Docker:**
 
 ```bash
-docker compose up -d --build                # Keycloak, realm setup, service-1..4
+docker compose up -d --build                # Keycloak, realm setup, portal, service-1..4
 docker compose logs -f keycloak-setup       # wait for "done."
-python3 demo.py                             # or: docker compose --profile demo run --rm demo
 ```
 
 **Without Docker** (needs Java 21, Maven, Python 3; downloads the Keycloak distribution):
 
 ```bash
-./run-local.sh          # starts everything and runs the demo
+./run-local.sh          # starts everything and runs the terminal demo
 ./run-local.sh stop
+```
+
+Admin console: http://localhost:8080/admin (admin/admin), realm `rfc8693`.
+
+## Demo A — the browser journey
+
+Open **http://localhost:8000** and sign in as `alice` / `alice`.
+
+```
+browser ──login──► Keycloak ──┐
+   │  ◄── token (aud=service-1, may_act=service-1)
+   │
+   └─ click ─► service-1 ─► service-2 ─► service-3 ─► service-4
+                                              (data comes back up the same way)
+```
+
+The portal is a plain static page (`ui/index.html`, no framework, no CDN). It does authorization
+code + PKCE against `web-app`, asking for `scope=openid delegate-to:service-1`, then calls service-1
+directly with the token it got back. One click starts the whole chain.
+
+It shows three things an audience can follow:
+
+1. **The token you came back with** — `sub` is alice, `aud` is service-1, `may_act` is service-1, and
+   there is no `act` yet, because alice is calling service-1 herself.
+2. **Behind the scenes** — one card per hop, showing that `sub` never stops being alice while `act`
+   gains one more nested actor each time, and what `aud`/`may_act` each minted token carried.
+3. **Can the token be misused?** — a button that hands alice's token straight to service-3, skipping
+   the chain. It comes back `401 token not active`. The other two attacks need client secrets, so they
+   live in `demo.py` rather than in browser code.
+
+The services label themselves Orders API / Billing / Payments / Ledger through `SERVICE_TITLE`; the
+Keycloak client IDs are still `service-1`..`service-4`. service-4 returns the account data via
+`SERVICE_DATA`.
+
+## Demo B — under the hood
+
+```bash
+python3 demo.py                             # or: docker compose --profile demo run --rm demo
 ```
 
 `demo.py` logs alice in, calls service-1, prints each hop's view of the token and runs 8 checks. 5 check
@@ -52,11 +89,9 @@ the happy path. 3 are negative checks:
 
 | Check | Result |
 |---|---|
-| service-3 called directly with alice's service-1 token | rejected (token isn't addressed to service-3) |
+| service-3 called directly with alice's service-1 token | `401 token not active` (introspection by service-3 reports `active: false`, because the token's `aud` is service-1) |
 | service-3 tries to exchange a token whose `may_act` names service-2 | `400 Actor user is not allowed by the may_act claim` |
 | service-1 tries to reuse the token it already delegated to service-2 | `400 Actor user is not allowed by the may_act claim` |
-
-Admin console: http://localhost:8080/admin (admin/admin), realm `rfc8693`.
 
 ## How it works
 
@@ -123,6 +158,7 @@ keycloak/
   setup_realm.py                   realm, user, clients, delegate-to scope, FGAP permission (admin REST API)
   delegation-chain-provider/       Java SPI: keeps the nested act chain
 services/service.py                generic service (validate → exchange → call next); run 4 times
+ui/index.html                      the portal: auth code + PKCE, one button, renders the whole chain
 demo.py                            end-to-end demo + checks
 run-local.sh                       no-Docker runner
 docker-compose.yml
@@ -139,8 +175,20 @@ docker-compose.yml
   technically request `delegate-to:service-4`.
 * **Tokens from token exchange** are access tokens only (no refresh token), backed by a transient session.
   The chain is valid only while alice's original SSO session is alive.
-* **`web-app` uses the password grant** only to keep the demo scriptable. Use authorization code + PKCE in
-  real life.
+* **The portal keeps alice's token in the browser**, deliberately: the whole point of the demo is to put
+  the real token on screen. In production, prefer a BFF — the server handles the callback, keeps the token
+  in a session, and proxies the call to service-1 — so a delegation token never reaches the browser at all.
+  `demo.py` still uses the password grant, purely so it stays scriptable; `ui/` uses authorization code +
+  PKCE, which is what you would actually ship.
+* **CORS, and why `webOrigins` is an explicit origin.** `web-app` lists `http://localhost:8000` rather than
+  `"+"`. `"+"` means "derive the allowed origins from the redirect URIs", and Keycloak cannot derive one
+  from the wildcard port in `http://localhost:*` — the preflight still succeeds, but the real `POST /token`
+  is refused with `{"error":"Invalid origin"}`, which reaches the browser only as `TypeError: Failed to
+  fetch`. Serving the portal from a different origin means adding it there (`PORTAL_ORIGIN` in
+  `setup_realm.py`). The services themselves send `Access-Control-Allow-Origin: *`, which is safe here
+  because they are bearer-authenticated and never read cookies.
+* **The portal needs a secure context.** PKCE uses `crypto.subtle`, which browsers only expose over HTTPS
+  or on localhost. Serving `ui/` from a LAN IP so other people can reach your laptop will break sign-in.
 * **Validation in the services.** Services validate tokens by introspection, which preserves `act`. Local
   JWT validation through JWKS works too: check `aud` contains yourself, then read `sub` and `act`.
 * **Secrets** are `<client-id>-secret`, and the admin login is admin/admin. Demo only.

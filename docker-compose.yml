@@ -1,7 +1,8 @@
 # RFC 8693 delegation-chain POC: alice -> service-1 -> service-2 -> service-3 -> service-4
 #
-#   docker compose up -d --build          # Keycloak + realm setup + 4 services
-#   python3 demo.py                       # or: docker compose run --rm demo
+#   docker compose up -d --build          # Keycloak + realm setup + portal + 4 services
+#   open http://localhost:8000            # the browser demo (log in as alice/alice)
+#   python3 demo.py                       # the terminal demo + checks
 x-service: &service
   build: ./services
   restart: unless-stopped
@@ -32,12 +33,22 @@ services:
     command: ["python3", "/setup_realm.py"]
     restart: "no"
 
+  # The portal the user actually opens. Static page; it does authorization code + PKCE in the
+  # browser and then calls service-1 directly, so there is no server-side code here.
+  ui:
+    image: python:3.13-alpine
+    volumes: ["./ui:/ui:ro"]
+    command: ["python3", "-m", "http.server", "8000", "--directory", "/ui"]
+    ports: ["8000:8000"]
+    restart: unless-stopped
+
   service-1:
     <<: *service
     ports: ["8081:8081"]
     environment:
       <<: *service-env
       SERVICE_NAME: service-1
+      SERVICE_TITLE: Orders API
       PORT: "8081"
       NEXT_SERVICE_URL: http://service-2:8082/
       NEXT_CLIENT_ID: service-2
@@ -48,6 +59,7 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: service-2
+      SERVICE_TITLE: Billing
       PORT: "8082"
       NEXT_SERVICE_URL: http://service-3:8083/
       NEXT_CLIENT_ID: service-3
@@ -58,17 +70,27 @@ services:
     environment:
       <<: *service-env
       SERVICE_NAME: service-3
+      SERVICE_TITLE: Payments
       PORT: "8083"
       NEXT_SERVICE_URL: http://service-4:8084/
       NEXT_CLIENT_ID: service-4
 
+  # The end of the chain: it owns the data the portal ultimately displays.
   service-4:
     <<: *service
     ports: ["8084:8084"]
     environment:
       <<: *service-env
       SERVICE_NAME: service-4
+      SERVICE_TITLE: Ledger
       PORT: "8084"
+      SERVICE_DATA: >-
+        {"account":"ACC-4471","holder":"Alice Example","currency":"EUR","balance":1284.55,
+         "transactions":[
+           {"date":"2026-10-21","description":"Order #10294 - Blue Widget x2","amount":-79.98},
+           {"date":"2026-10-19","description":"Refund - Order #10231","amount":24.50},
+           {"date":"2026-10-15","description":"Order #10180 - Annual support plan","amount":-349.00},
+           {"date":"2026-10-01","description":"Salary credit","amount":2100.00}]}
 
   demo:
     image: python:3.13-alpine

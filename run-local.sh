@@ -34,19 +34,35 @@ until curl -sf http://localhost:8080/realms/master > /dev/null; do sleep 2; done
 
 python3 keycloak/setup_realm.py
 
+TITLES=("Orders API" "Billing" "Payments" "Ledger")
+LEDGER='{"account":"ACC-4471","holder":"Alice Example","currency":"EUR","balance":1284.55,
+ "transactions":[
+   {"date":"2026-10-21","description":"Order #10294 - Blue Widget x2","amount":-79.98},
+   {"date":"2026-10-19","description":"Refund - Order #10231","amount":24.50},
+   {"date":"2026-10-15","description":"Order #10180 - Annual support plan","amount":-349.00},
+   {"date":"2026-10-01","description":"Salary credit","amount":2100.00}]}'
+
 for i in 1 2 3 4; do
   next=$((i + 1))
   if (( i < 4 )); then
     export NEXT_SERVICE_URL="http://localhost:808$next/" NEXT_CLIENT_ID="service-$next"
+    unset SERVICE_DATA
   else
     unset NEXT_SERVICE_URL NEXT_CLIENT_ID
+    export SERVICE_DATA="$LEDGER"   # the last hop owns the data the portal shows
   fi
-  SERVICE_NAME="service-$i" PORT="808$i" nohup python3 services/service.py > "$WORK/service-$i.log" 2>&1 &
+  SERVICE_NAME="service-$i" SERVICE_TITLE="${TITLES[i-1]}" PORT="808$i" \
+    nohup python3 services/service.py > "$WORK/service-$i.log" 2>&1 &
   echo $! > "$WORK/service-$i.pid"
 done
 sleep 1
 
+echo "starting the portal on :8000 ..."
+nohup python3 -m http.server 8000 --directory ui > "$WORK/ui.log" 2>&1 &
+echo $! > "$WORK/ui.pid"
+
 python3 demo.py
 echo
+echo "Portal (the browser demo):  http://localhost:8000   (log in as alice/alice)"
 echo "Keycloak admin console: http://localhost:8080/admin (admin/admin), realm 'rfc8693'"
-echo "service logs: $WORK/service-*.log    stop with: ./run-local.sh stop"
+echo "logs: $WORK/service-*.log, $WORK/ui.log    stop with: ./run-local.sh stop"

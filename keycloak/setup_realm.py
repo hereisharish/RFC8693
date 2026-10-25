@@ -22,6 +22,7 @@ SERVICES = ["service-1", "service-2", "service-3", "service-4"]
 SERVICE_SECRET = "{}-secret"  # POC only: secret = "<client-id>-secret"
 USER, USER_PASSWORD = "alice", "alice"
 DELEGATION_SCOPE = "delegate-to"
+PORTAL_ORIGIN = os.environ.get("PORTAL_ORIGIN", "http://localhost:8000")  # where ui/index.html is served
 
 
 def http(method, path, token=None, body=None, form=None, ok=(200, 201, 204)):
@@ -68,7 +69,7 @@ def main():
     http("POST", "/admin/realms", t, {
         "realm": REALM, "enabled": True,
         "adminPermissionsEnabled": True,
-        "accessTokenLifespan": 300,
+        "accessTokenLifespan": 1800,  # long enough to survive a live demo; the UI also silently refreshes
     })
     print(f"realm '{REALM}' created")
 
@@ -80,12 +81,19 @@ def main():
     })
 
     # 3. Clients
-    #    web-app: the front end the user logs in to (public client; password grant only to keep the POC scriptable)
+    #    web-app: the front end the user logs in to. The ui/ portal uses authorization code + PKCE
+    #             against this client; directAccessGrants stays on only so demo.py can stay scriptable.
     #    service-N: confidential clients with a service account and standard token exchange enabled
+    #    webOrigins must be an explicit origin, not "+": "+" means "derive the CORS origins from the
+    #    redirect URIs", and Keycloak cannot derive one from the wildcard port in http://localhost:*.
+    #    The preflight still passes, but the real POST /token is refused with {"error":"Invalid origin"},
+    #    which surfaces in the browser as an opaque "TypeError: Failed to fetch".
     http("POST", f"{a}/clients", t, {
         "clientId": "web-app", "publicClient": True, "standardFlowEnabled": True,
-        "directAccessGrantsEnabled": True, "redirectUris": ["http://localhost:*"], "webOrigins": ["+"],
+        "directAccessGrantsEnabled": True, "redirectUris": ["http://localhost:*"],
+        "webOrigins": [PORTAL_ORIGIN],
         "fullScopeAllowed": False,
+        "attributes": {"post.logout.redirect.uris": "+"},  # let the portal's sign-out return to itself
     })
     for s in SERVICES:
         http("POST", f"{a}/clients", t, {

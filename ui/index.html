@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northwind Portal — RFC 8693 delegation demo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #14171f; --muted: #646b7a;
+    --line: #e2e5ea; --accent: #2f6df6; --good: #0f8a4a; --bad: #c62f3b;
+    --code-bg: #f1f3f6; --chip: #eef2fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1a1e26; --ink: #e8eaf0; --muted: #98a0b0;
+      --line: #2a3040; --accent: #6b9bff; --good: #44c483; --bad: #ff6b78;
+      --code-bg: #121620; --chip: #1f2735;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 24px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+  }
+  header .logo { font-weight: 700; font-size: 18px; letter-spacing: -.01em; }
+  header .logo span { color: var(--accent); }
+  header .spacer { flex: 1; }
+  .who { font-size: 14px; color: var(--muted); }
+  main { max-width: 980px; margin: 0 auto; padding: 28px 24px 80px; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -.02em; }
+  h2 { font-size: 17px; margin: 0 0 14px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px; margin-bottom: 20px;
+  }
+  button {
+    font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+    border: 0; border-radius: 8px; padding: 11px 18px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 14px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; overflow-x: auto; font-size: 12.5px; margin: 10px 0 0;
+  }
+  .chip {
+    display: inline-block; background: var(--chip); border: 1px solid var(--line);
+    border-radius: 999px; padding: 2px 10px; font-size: 12.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; }
+  .path b { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12.5px; text-transform: uppercase; letter-spacing: .04em; }
+  td.amt { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td.amt.neg { color: var(--bad); }
+  td.amt.pos { color: var(--good); }
+  .balance { font-size: 32px; font-weight: 700; letter-spacing: -.02em; }
+  .hop {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; background: var(--panel);
+    opacity: 0; transform: translateY(6px); animation: in .45s ease forwards;
+  }
+  @keyframes in { to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .hop { animation: none; opacity: 1; transform: none; } }
+  .hop h3 { margin: 0 0 10px; font-size: 15px; }
+  .hop h3 .n {
+    display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 12px; margin-right: 8px; vertical-align: 1px;
+  }
+  .hop h3 small { color: var(--muted); font-weight: 400; }
+  .note { font-size: 13.5px; color: var(--muted); margin: 10px 0 0; }
+  .ok { color: var(--good); font-weight: 600; }
+  .fail { color: var(--bad); font-weight: 600; }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; font-size: 13.5px; color: var(--accent); }
+  .hidden { display: none !important; }
+  .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; margin-bottom: 16px; }
+  .banner.err { background: rgba(198,47,59,.1); border: 1px solid var(--bad); color: var(--bad); }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.4);
+          border-top-color: #fff; border-radius: 50%; animation: sp .7s linear infinite; vertical-align: -2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Northwind<span>Portal</span></div>
+  <div class="spacer"></div>
+  <div class="who" id="who"></div>
+  <button class="ghost hidden" id="signout">Sign out</button>
+</header>
+
+<main>
+  <div id="banner"></div>
+
+  <!-- ANONYMOUS -->
+  <section id="anon" class="hidden">
+    <h1>Your account</h1>
+    <p class="sub">This page needs to know who you are before it can show anything.</p>
+    <div class="panel">
+      <h2>You're not signed in</h2>
+      <p class="note" style="margin-top:0">
+        Clicking below sends you to Keycloak's own login page. You'll come straight back here afterwards.
+        Sign in as <code>alice</code> / <code>alice</code>.
+      </p>
+      <p style="margin-bottom:0"><button id="signin">Sign in</button></p>
+    </div>
+  </section>
+
+  <!-- SIGNED IN -->
+  <section id="app" class="hidden">
+    <h1>Your account</h1>
+    <p class="sub" id="greeting"></p>
+
+    <div class="panel">
+      <h2>The token you came back with</h2>
+      <dl class="kv" id="usertok"></dl>
+      <p class="note">
+        This token names <b>you</b> as the subject and is addressed to <b>service-1</b> only.
+        <code>may_act</code> says service-1 — and nobody else — may act on your behalf with it.
+        There's no <code>act</code> claim yet, because you're calling service-1 yourself.
+      </p>
+      <details>
+        <summary>Show all claims</summary>
+        <pre id="usertok-raw"></pre>
+      </details>
+    </div>
+
+    <div class="panel">
+      <h2>Load your data</h2>
+      <p class="note" style="margin-top:0">
+        One request leaves this page, to the Orders API. Behind it, four services talk to each other
+        and the answer comes back up the same way.
+      </p>
+      <p style="margin-bottom:0">
+        <button id="load">Load my account summary</button>
+      </p>
+    </div>
+
+    <div id="result"></div>
+  </section>
+</main>
+
+<script>
+const CONFIG = {
+  kc:       "http://localhost:8080",
+  realm:    "rfc8693",
+  clientId: "web-app",
+  scope:    "openid delegate-to:service-1",
+  service1: "http://localhost:8081/",
+  service3: "http://localhost:8083/",
+};
+const OIDC     = `${CONFIG.kc}/realms/${CONFIG.realm}/protocol/openid-connect`;
+const REDIRECT = location.origin + location.pathname;
+const LABELS   = { "service-1": "Orders API", "service-2": "Billing",
+                   "service-3": "Payments",   "service-4": "Ledger" };
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+/* ---------- PKCE + OIDC ---------- */
+const b64url = bytes => btoa(String.fromCharCode(...bytes))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+function randomString(n) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return b64url(a);
+}
+
+async function pkceChallenge(verifier) {
+  // crypto.subtle needs a secure context; http://localhost counts as one.
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return b64url(new Uint8Array(digest));
+}
+
+function claims(jwt) {
+  const b64 = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - b64.length % 4) % 4));
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))));
+}
+
+const tokens = {
+  get access()  { return sessionStorage.getItem("access_token"); },
+  get refresh() { return sessionStorage.getItem("refresh_token"); },
+  get id()      { return sessionStorage.getItem("id_token"); },
+  save(t) {
+    sessionStorage.setItem("access_token", t.access_token);
+    if (t.refresh_token) sessionStorage.setItem("refresh_token", t.refresh_token);
+    if (t.id_token)      sessionStorage.setItem("id_token", t.id_token);
+  },
+};
+
+async function signIn() {
+  const verifier = randomString(32), state = randomString(16);
+  sessionStorage.setItem("pkce_verifier", verifier);
+  sessionStorage.setItem("oidc_state", state);
+  const p = new URLSearchParams({
+    client_id: CONFIG.clientId, response_type: "code", redirect_uri: REDIRECT,
+    scope: CONFIG.scope, state,
+    code_challenge: await pkceChallenge(verifier), code_challenge_method: "S256",
+  });
+  // scope carries the parameterized delegate-to:service-1 — this is what puts may_act in the token
+  location.assign(`${OIDC}/auth?${p}`);
+}
+
+function signOut() {
+  const hint = tokens.id;
+  sessionStorage.clear();
+  const p = new URLSearchParams({ post_logout_redirect_uri: REDIRECT, client_id: CONFIG.clientId });
+  if (hint) p.set("id_token_hint", hint);
+  location.assign(`${OIDC}/logout?${p}`);
+}
+
+/** Handle ?code=... on load. Returns true if we just completed a login. */
+async function handleCallback() {
+  const q = new URLSearchParams(location.search);
+  const clean = () => history.replaceState({}, "", location.pathname);
+
+  if (q.get("error")) {
+    showError(`Login failed: ${q.get("error")} — ${q.get("error_description") || ""}`);
+    clean();
+    return false;
+  }
+  const code = q.get("code");
+  if (!code) return false;
+
+  if (q.get("state") !== sessionStorage.getItem("oidc_state")) {
+    showError("Login failed: state mismatch (possible CSRF). Try signing in again.");
+    clean();
+    return false;
+  }
+
+  const r = await fetch(`${OIDC}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code", client_id: CONFIG.clientId, code,
+      redirect_uri: REDIRECT, code_verifier: sessionStorage.getItem("pkce_verifier"),
+    }),
+  });
+  const body = await r.json();
+  clean();
+  if (!r.ok) {
+    showError(`Could not exchange the authorization code: ${body.error_description || body.error}`);
+    return false;
+  }
+  tokens.save(body);
+  sessionStorage.removeItem("pkce_verifier");
+  return true;
+}
+
+async function refreshTokens() {
+  if (!tokens.refresh) return false;
+  const r = await fetch(`${OIDC}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token", client_id: CONFIG.clientId, refresh_token: tokens.refresh,
+    }),
+  });
+  if (!r.ok) return false;
+  tokens.save(await r.json());   // a refreshed token keeps aud=service-1 and may_act
+  return true;
+}
+
+/* ---------- rendering ---------- */
+function showError(msg) {
+  $("banner").innerHTML = `<div class="banner err">${esc(msg)}</div>`;
+}
+
+function label(id) { return LABELS[id] ? `${LABELS[id]} (${id})` : id; }
+
+/** Nested act -> array of client_ids, most recent actor first. */
+function actors(act) {
+  const out = [];
+  while (act && typeof act === "object") {
+    out.push(act.client_id || act.sub);
+    act = act.act;
+  }
+  return out;
+}
+
+function renderUser() {
+  const c = claims(tokens.access);
+  $("who").textContent = `${c.name || c.preferred_username} · ${c.preferred_username}`;
+  $("signout").classList.remove("hidden");
+  $("greeting").innerHTML =
+    `Signed in as <b>${esc(c.name || c.preferred_username)}</b>. Everything below happens on your behalf.`;
+  $("usertok").innerHTML = [
+    ["sub (who this is about)", `${c.preferred_username} — ${c.sub}`],
+    ["aud (who may receive it)", c.aud],
+    ["may_act (who may act for you)", (c.may_act && c.may_act.client_id) || "—"],
+    ["act (chain so far)", c.act ? JSON.stringify(c.act) : "none — you're the caller"],
+  ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+  $("usertok-raw").textContent = JSON.stringify(c, null, 2);
+}
+
+function renderChain(root) {
+  const hops = [];
+  for (let h = root; h; h = h.downstream) hops.push(h);
+  const last = hops[hops.length - 1];
+  const data = [...hops].reverse().find(h => h.data)?.data;
+
+  let html = "";
+
+  /* the business answer */
+  if (data) {
+    const rows = (data.transactions || []).map(t => `
+      <tr><td>${esc(t.date)}</td><td>${esc(t.description)}</td>
+      <td class="amt ${t.amount < 0 ? "neg" : "pos"}">${t.amount < 0 ? "" : "+"}${t.amount.toFixed(2)}</td></tr>`).join("");
+    html += `
+      <div class="panel">
+        <h2>Account summary</h2>
+        <div class="balance">${esc(data.currency || "")} ${Number(data.balance).toFixed(2)}</div>
+        <p class="note" style="margin-top:4px">
+          Account ${esc(data.account)} · ${esc(data.holder)} —
+          served by <b>${esc(label(last.service))}</b>, four services away from this page.
+        </p>
+        <table style="margin-top:14px">
+          <thead><tr><th>Date</th><th>Description</th><th style="text-align:right">Amount</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  /* the delegation journey */
+  html += `<div class="panel"><h2>Behind the scenes — ${hops.length} hops</h2>
+    <p class="path" style="margin-top:0">${
+      last.call_path.split(" -> ").map((n, i) => i === 0 ? `<b>${esc(n)}</b>` : esc(n)).join(" → ")
+    }</p>
+    <p class="note">Watch two things: <code>sub</code> never stops being Alice, and <code>act</code>
+    gains one more nested actor at every hop.</p><div style="margin-top:16px">`;
+
+  hops.forEach((h, i) => {
+    const chain = actors(h.act);
+    const next = h.exchanged_token_for_next_hop;
+    html += `
+      <div class="hop" style="animation-delay:${i * 160}ms">
+        <h3><span class="n">${i + 1}</span>${esc(LABELS[h.service] || h.service)}
+            <small>${esc(h.service)}</small></h3>
+        <dl class="kv">
+          <dt>sees the user as</dt><dd>${esc(h.user)}${h.user === "alice" ? ' <span class="ok">✓ still Alice</span>' : ""}</dd>
+          <dt>called directly by</dt><dd>${esc(h.immediate_caller)}</dd>
+          <dt>act chain received</dt>
+          <dd>${chain.length ? chain.slice().reverse().map(esc).join(" → ") : "— (first hop)"}</dd>
+        </dl>
+        ${next ? `<p class="note">Exchanged its token for a new one
+            (<span class="chip">aud ${esc(Array.isArray(next.aud) ? next.aud[0] : next.aud)}</span>
+             <span class="chip">may_act ${esc(next.may_act && next.may_act.client_id)}</span>
+             <span class="chip">act nests ${actors(next.act).length} deep</span>)
+            and called ${esc(label(hops[i + 1].service))}.</p>
+          <details><summary>Show the act claim it minted</summary>
+          <pre>${esc(JSON.stringify(next.act, null, 2))}</pre></details>`
+          : `<p class="note">Last hop — it owns the data, so it answers instead of delegating.</p>`}
+      </div>`;
+  });
+  html += `</div></div>`;
+
+  /* negative check */
+  html += `
+    <div class="panel">
+      <h2>Can the token be misused?</h2>
+      <p class="note" style="margin-top:0">
+        Your token is addressed to service-1. Try handing that same token straight to
+        <b>Payments (service-3)</b>, skipping the chain.
+      </p>
+      <p><button class="ghost" id="attack">Call Payments directly with my token</button></p>
+      <div id="attack-out"></div>
+      <p class="note">
+        The two other attacks — a service exchanging a token meant for a different service, and a service
+        replaying a token it already delegated away — need client secrets, so they stay out of this page.
+        <code>python3 demo.py</code> runs all three.
+      </p>
+    </div>
+
+    <details>
+      <summary>Show the raw response from service-1</summary>
+      <pre>${esc(JSON.stringify(root, null, 2))}</pre>
+    </details>`;
+
+  $("result").innerHTML = html;
+  $("attack").addEventListener("click", attack);
+}
+
+async function attack(e) {
+  const out = $("attack-out");
+  e.target.disabled = true;
+  out.innerHTML = `<p class="note">Calling service-3 …</p>`;
+  // Deliberately no refresh-and-retry here: a 401 is the result we want to see.
+  let status, body;
+  try {
+    const r = await fetch(CONFIG.service3, { headers: { Authorization: `Bearer ${tokens.access}` } });
+    status = r.status;
+    body = await r.text();
+  } catch (err) {
+    out.innerHTML = `<p class="fail">Request failed: ${esc(err.message)}</p>`;
+    e.target.disabled = false;
+    return;
+  }
+  const rejected = status === 401 || status === 403;
+  out.innerHTML = `
+    <p class="${rejected ? "ok" : "fail"}">
+      ${rejected ? `Rejected with HTTP ${status} — as it should be.` : `Unexpected: HTTP ${status}`}
+    </p>
+    <pre>${esc(body)}</pre>
+    ${rejected ? `<p class="note">service-3 introspected the token, saw it was not issued for it,
+      and refused. Nothing in the chain can be short-circuited.</p>` : ""}`;
+  e.target.disabled = false;
+}
+
+/* ---------- the button that starts the chain ---------- */
+async function loadSummary(e) {
+  const btn = e.target;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin"></span> Calling Orders API …`;
+  $("banner").innerHTML = "";
+
+  try {
+    let r = await fetch(CONFIG.service1, { headers: { Authorization: `Bearer ${tokens.access}` } });
+    if (r.status === 401 && await refreshTokens()) {
+      r = await fetch(CONFIG.service1, { headers: { Authorization: `Bearer ${tokens.access}` } });
+    }
+    const body = await r.json().catch(() => null);
+    if (r.status === 401) {
+      showError("Your session expired. Sign out and sign in again to continue.");
+      return;
+    }
+    if (!r.ok) {
+      showError(`The chain returned HTTP ${r.status}. Details below.`);
+      $("result").innerHTML = `<pre>${esc(JSON.stringify(body, null, 2))}</pre>`;
+      return;
+    }
+    renderChain(body);
+  } catch (err) {
+    showError(`Could not reach service-1 at ${CONFIG.service1} — is the stack up? (${err.message})`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Load my account summary";
+  }
+}
+
+/* ---------- boot ---------- */
+(async function main() {
+  $("signin").addEventListener("click", () => signIn());
+  $("signout").addEventListener("click", signOut);
+  $("load").addEventListener("click", loadSummary);
+
+  // Never let a failed callback leave a blank page: fall through to the signed-out view with a reason.
+  try {
+    await handleCallback();
+  } catch (err) {
+    showError(`Could not finish signing in: ${err.message}. Check that Keycloak is reachable at `
+      + `${CONFIG.kc} and that "${location.origin}" is listed as a Web origin on the web-app client.`);
+    history.replaceState({}, "", location.pathname);
+  }
+
+  if (tokens.access) {
+    $("app").classList.remove("hidden");
+    renderUser();
+  } else {
+    $("anon").classList.remove("hidden");
+  }
+})();
+</script>
+</body>
+</html>

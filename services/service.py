@@ -26,6 +26,8 @@ KC_URL = os.environ.get("KC_URL", "http://localhost:8080").rstrip("/")
 REALM = os.environ.get("REALM", "rfc8693")
 NEXT_URL = os.environ.get("NEXT_SERVICE_URL")
 NEXT_CLIENT = os.environ.get("NEXT_CLIENT_ID")
+TITLE = os.environ.get("SERVICE_TITLE", NAME)       # business label shown in the UI
+DATA = os.environ.get("SERVICE_DATA")               # JSON payload this service owns (the last hop's answer)
 
 OIDC = f"{KC_URL}/realms/{REALM}/protocol/openid-connect"
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -86,13 +88,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def cors(self):
+        """The browser calls service-1 directly. Safe to allow any origin: these endpoints are
+        bearer-authenticated and never read cookies, so there is no ambient authority to steal."""
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+
     def reply(self, status, body):
         data = json.dumps(body, indent=2).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.cors()
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         auth = self.headers.get("Authorization", "")
@@ -116,12 +132,15 @@ class Handler(BaseHTTPRequestHandler):
 
         result = {
             "service": NAME,
+            "title": TITLE,
             "user": user,
             "sub": info.get("sub"),
             "immediate_caller": chain[0] if chain else user,
             "call_path": " -> ".join(call_path),
             "act": info.get("act"),
         }
+        if DATA:
+            result["data"] = json.loads(DATA)
 
         if NEXT_URL:
             try:
