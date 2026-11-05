@@ -1,0 +1,55 @@
+# Overlay: put Kong Gateway Enterprise between the services and do every token exchange in Kong.
+#
+#   export KONG_LICENSE_DATA="$(cat license.json)"      # Kong Enterprise / Konnect trial licence
+#   docker compose -f docker-compose.yml -f docker-compose.kong.yml up -d --build
+#   KONG_URL=http://localhost:8000 python3 demo.py
+#
+# Services talk only to Kong: chain hops go to Kong routes, actor tokens and introspection go
+# through Kong's /idp route. See gateways/kong/README.md.
+x-via-kong: &via-kong
+  EXCHANGE_VIA: gateway
+  KC_URL: http://kong:8000/idp
+  REALM: rfc8693
+
+services:
+  kong:
+    image: kong/kong-gateway:3.16.0.1
+    depends_on: [keycloak]
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yaml
+      KONG_PLUGINS: bundled
+      KONG_LICENSE_DATA: ${KONG_LICENSE_DATA:?set KONG_LICENSE_DATA to a Kong Enterprise licence}
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 127.0.0.1:8001
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+    volumes: ["./gateways/kong/kong.yaml:/kong/kong.yaml:ro"]
+    ports: ["8000:8000"]
+
+  service-1:
+    depends_on: [kong]
+    environment:
+      <<: *via-kong
+      NEXT_SERVICE_URL: http://kong:8000/service-1/to/service-2
+
+  service-2:
+    depends_on: [kong]
+    environment:
+      <<: *via-kong
+      NEXT_SERVICE_URL: http://kong:8000/service-2/to/service-3
+
+  service-3:
+    depends_on: [kong]
+    environment:
+      <<: *via-kong
+      NEXT_SERVICE_URL: http://kong:8000/service-3/to/service-4
+
+  service-4:
+    depends_on: [kong]
+    environment:
+      <<: *via-kong
+
+  demo:
+    environment:
+      KONG_URL: http://kong:8000

@@ -58,6 +58,13 @@ the happy path. 3 are negative checks:
 
 Admin console: http://localhost:8080/admin (admin/admin), realm `rfc8693`.
 
+## Through Kong Gateway
+
+On this branch, Kong can do every token exchange instead of the services: see
+[`gateways/kong/README.md`](gateways/kong/README.md). `./run-local.sh kong-standin` runs the chain
+through a local stand-in for Kong. `docker-compose.kong.yml` runs it through Kong Gateway Enterprise,
+which needs a licence.
+
 ## How it works
 
 ### Keycloak features used (26.8.1)

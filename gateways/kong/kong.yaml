@@ -1,0 +1,154 @@
+# Kong Gateway (DB-less) for the RFC 8693 delegation chain.
+#
+# Route <caller>/to/<target>: the caller sends the token it received plus its own actor token in
+# X-Actor-Token. The openid-connect plugin, authenticating to Keycloak AS THE CALLER, exchanges it for a
+# token addressed to the target (scope delegate-to:<target> -> may_act + aud), checks the new token's
+# audience, and forwards it upstream. request-transformer then drops X-Actor-Token.
+# Route /idp proxies everything else agents need from Keycloak (actor tokens, introspection).
+#
+# Requires Kong Gateway Enterprise 3.16+ (openid-connect is an Enterprise plugin; actor tokens are 3.16+).
+# Client secrets are the POC's "<client-id>-secret" values; use Kong vault references in real deployments.
+_format_version: '3.0'
+services:
+- name: keycloak
+  url: http://keycloak:8080
+  routes:
+  - name: idp
+    paths:
+    - /idp
+    strip_path: true
+- name: service-1-to-service-2
+  url: http://service-2:8082
+  routes:
+  - name: service-1-to-service-2
+    paths:
+    - /service-1/to/service-2
+    strip_path: true
+    plugins:
+    - name: openid-connect
+      config:
+        issuer: http://localhost:8080/realms/rfc8693
+        using_pseudo_issuer: true
+        jwks_endpoint: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/certs
+        token_endpoint: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/token
+        client_id:
+        - service-1
+        client_secret:
+        - service-1-secret
+        client_auth:
+        - client_secret_post
+        auth_methods:
+        - bearer
+        audience_required:
+        - service-2
+        cache_tokens: false
+        token_exchange:
+          subject_token_issuers:
+          - issuer: http://localhost:8080/realms/rfc8693
+            verify_signature: true
+            jwks_uri: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/certs
+            conditions:
+              has_audience:
+              - service-1
+          request:
+            scopes:
+            - delegate-to:service-2
+            actor_token:
+              source: header
+              header_name: X-Actor-Token
+              type: urn:ietf:params:oauth:token-type:access_token
+    - name: request-transformer
+      config:
+        remove:
+          headers:
+          - X-Actor-Token
+- name: service-2-to-service-3
+  url: http://service-3:8083
+  routes:
+  - name: service-2-to-service-3
+    paths:
+    - /service-2/to/service-3
+    strip_path: true
+    plugins:
+    - name: openid-connect
+      config:
+        issuer: http://localhost:8080/realms/rfc8693
+        using_pseudo_issuer: true
+        jwks_endpoint: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/certs
+        token_endpoint: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/token
+        client_id:
+        - service-2
+        client_secret:
+        - service-2-secret
+        client_auth:
+        - client_secret_post
+        auth_methods:
+        - bearer
+        audience_required:
+        - service-3
+        cache_tokens: false
+        token_exchange:
+          subject_token_issuers:
+          - issuer: http://localhost:8080/realms/rfc8693
+            verify_signature: true
+            jwks_uri: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/certs
+            conditions:
+              has_audience:
+              - service-2
+          request:
+            scopes:
+            - delegate-to:service-3
+            actor_token:
+              source: header
+              header_name: X-Actor-Token
+              type: urn:ietf:params:oauth:token-type:access_token
+    - name: request-transformer
+      config:
+        remove:
+          headers:
+          - X-Actor-Token
+- name: service-3-to-service-4
+  url: http://service-4:8084
+  routes:
+  - name: service-3-to-service-4
+    paths:
+    - /service-3/to/service-4
+    strip_path: true
+    plugins:
+    - name: openid-connect
+      config:
+        issuer: http://localhost:8080/realms/rfc8693
+        using_pseudo_issuer: true
+        jwks_endpoint: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/certs
+        token_endpoint: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/token
+        client_id:
+        - service-3
+        client_secret:
+        - service-3-secret
+        client_auth:
+        - client_secret_post
+        auth_methods:
+        - bearer
+        audience_required:
+        - service-4
+        cache_tokens: false
+        token_exchange:
+          subject_token_issuers:
+          - issuer: http://localhost:8080/realms/rfc8693
+            verify_signature: true
+            jwks_uri: http://keycloak:8080/realms/rfc8693/protocol/openid-connect/certs
+            conditions:
+              has_audience:
+              - service-3
+          request:
+            scopes:
+            - delegate-to:service-4
+            actor_token:
+              source: header
+              header_name: X-Actor-Token
+              type: urn:ietf:params:oauth:token-type:access_token
+    - name: request-transformer
+      config:
+        remove:
+          headers:
+          - X-Actor-Token

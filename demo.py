@@ -12,6 +12,7 @@ KC_URL = os.environ.get("KC_URL", "http://localhost:8080").rstrip("/")
 REALM = os.environ.get("REALM", "rfc8693")
 SERVICE_1 = os.environ.get("SERVICE_1_URL", "http://localhost:8081/")
 SERVICE_3 = os.environ.get("SERVICE_3_URL", "http://localhost:8083/")
+KONG_URL = os.environ.get("KONG_URL", "").rstrip("/")  # set when the chain runs through Kong
 TOKEN_URL = f"{KC_URL}/realms/{REALM}/protocol/openid-connect/token"
 
 
@@ -24,13 +25,14 @@ def post(form):
         return e.code, json.loads(e.read().decode())
 
 
-def get(url, token):
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+def get(url, token, headers=None):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", **(headers or {})})
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, json.load(r)
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
+        body = e.read().decode()
+        return e.code, json.loads(body) if body.startswith("{") else {"error": body}
 
 
 def claims(token):
@@ -107,6 +109,27 @@ s2_status, err2 = post({"grant_type": "urn:ietf:params:oauth:grant-type:token-ex
                         "scope": "delegate-to:service-3"})
 results.append(check(f"service-1 cannot re-use the service-2 token (HTTP {s2_status}: {err2.get('error_description')})",
                      s2_status in (400, 403)))
+
+if KONG_URL:
+    banner("5. Gateway checks (Kong performs every exchange)")
+    results.append(check("every hop's exchange was done by the gateway",
+                         all(h.get("token_exchange") == "by gateway" for h in paths[:-1])))
+    results.append(check("no service received an X-Actor-Token header",
+                         not any(h.get("received_x_actor_token") for h in paths)))
+    # d) the wrong agent's actor token on service-1's route: Keycloak refuses the exchange Kong makes as service-1
+    status, body = get(f"{KONG_URL}/service-1/to/service-2", user_token, {"X-Actor-Token": s3_actor})
+    results.append(check(f"route service-1→service-2 refuses service-3's actor token (HTTP {status})",
+                         status in (400, 401, 403)))
+    # e) a token not addressed to the caller: no exchange, and the forwarded token fails audience_required
+    s2 = {"client_id": "service-2", "client_secret": "service-2-secret"}
+    s2_actor = post({"grant_type": "client_credentials", **s2})[1]["access_token"]
+    status, body = get(f"{KONG_URL}/service-2/to/service-3", user_token, {"X-Actor-Token": s2_actor})
+    results.append(check(f"route service-2→service-3 refuses a token addressed to service-1 (HTTP {status})",
+                         status in (400, 401, 403)))
+    # f) no actor token at all: Keycloak's standard exchange refuses a token carrying may_act
+    status, body = get(f"{KONG_URL}/service-1/to/service-2", user_token)
+    results.append(check(f"route service-1→service-2 refuses a request without an actor token (HTTP {status})",
+                         status in (400, 401, 403)))
 
 print(f"\n{sum(results)}/{len(results)} checks passed")
 sys.exit(0 if all(results) else 1)

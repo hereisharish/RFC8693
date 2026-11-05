@@ -8,8 +8,11 @@ For each request it:
        subject_token = the token it received, actor_token = its own client-credentials token,
        scope = delegate-to:<next client>
      and calls the next service with the new token.
+     With EXCHANGE_VIA=gateway the service skips the exchange: it calls NEXT_SERVICE_URL (a Kong route) with the
+     token it received plus its own actor token in X-Actor-Token, and Kong performs the exchange.
 
-Env: SERVICE_NAME, CLIENT_SECRET, PORT, KC_URL, REALM, NEXT_SERVICE_URL, NEXT_CLIENT_ID
+Env: SERVICE_NAME, CLIENT_SECRET, PORT, KC_URL, REALM, NEXT_SERVICE_URL, NEXT_CLIENT_ID,
+     EXCHANGE_VIA (keycloak | gateway)
 """
 import base64
 import json
@@ -26,6 +29,7 @@ KC_URL = os.environ.get("KC_URL", "http://localhost:8080").rstrip("/")
 REALM = os.environ.get("REALM", "rfc8693")
 NEXT_URL = os.environ.get("NEXT_SERVICE_URL")
 NEXT_CLIENT = os.environ.get("NEXT_CLIENT_ID")
+VIA_GATEWAY = os.environ.get("EXCHANGE_VIA", "keycloak") == "gateway"
 
 OIDC = f"{KC_URL}/realms/{REALM}/protocol/openid-connect"
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -121,22 +125,30 @@ class Handler(BaseHTTPRequestHandler):
             "immediate_caller": chain[0] if chain else user,
             "call_path": " -> ".join(call_path),
             "act": info.get("act"),
+            "received_x_actor_token": "X-Actor-Token" in self.headers,
         }
 
         if NEXT_URL:
-            try:
-                new_token = exchange(token)
-            except HttpError as e:
-                result["token_exchange_error"] = json.loads(e.body) if e.body.startswith("{") else e.body
-                return self.reply(502, result)
-            c = jwt_claims(new_token)
-            result["exchanged_token_for_next_hop"] = {k: c.get(k) for k in ("sub", "azp", "aud", "may_act", "act")}
-            req = urllib.request.Request(NEXT_URL, headers={"Authorization": f"Bearer {new_token}"})
+            if VIA_GATEWAY:
+                result["token_exchange"] = "by gateway"
+                headers = {"Authorization": f"Bearer {token}", "X-Actor-Token": own_token()}
+            else:
+                try:
+                    new_token = exchange(token)
+                except HttpError as e:
+                    result["token_exchange_error"] = json.loads(e.body) if e.body.startswith("{") else e.body
+                    return self.reply(502, result)
+                c = jwt_claims(new_token)
+                result["token_exchange"] = "by service"
+                result["exchanged_token_for_next_hop"] = {k: c.get(k) for k in ("sub", "azp", "aud", "may_act", "act")}
+                headers = {"Authorization": f"Bearer {new_token}"}
+            req = urllib.request.Request(NEXT_URL, headers=headers)
             try:
                 with urllib.request.urlopen(req) as r:
                     result["downstream"] = json.load(r)
             except urllib.error.HTTPError as e:
-                result["downstream"] = json.loads(e.read().decode())
+                body = e.read().decode()
+                result["downstream"] = json.loads(body) if body.startswith("{") else {"status": e.code, "body": body}
                 return self.reply(502, result)
         return self.reply(200, result)
 

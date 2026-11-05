@@ -1,90 +1,98 @@
-# Kong AI Gateway with the RFC 8693 delegation chain
+# Kong Gateway between the services: Kong does every Keycloak call
 
-Status: **design notes, not yet built or run.** Based on Kong's docs
-(github.com/Kong/developer.konghq.com) and the Keycloak 26.8.1 source.
-
-## Where Kong fits
-
-Kong does not issue tokens. Keycloak (with the `delegation-chain` plugin on this branch) stays the
-authorization server that issues every token and builds the nested `act` chain. Kong sits in front of
-agents and MCP tools and does three jobs:
-
-| Job | Kong plugin | Tier / version |
-|---|---|---|
-| Validate the incoming token (issuer, signature, expiry, audience) | OpenID Connect, or AI MCP OAuth2 for MCP servers | Enterprise; AI MCP OAuth2 is AI Gateway Enterprise, 3.12+ |
-| RFC 8693 exchange before forwarding to the next hop | OpenID Connect `config.token_exchange` (3.14+, actor token 3.16+) or AI MCP OAuth2 `config.token_exchange` (3.14+, **tech preview**) | Enterprise |
-| Per-tool authorization on MCP traffic | AI MCP OAuth2 `consumer_claim` → Kong Consumer, then AI MCP Proxy tool ACLs | AI Gateway Enterprise, 3.13+ |
-
-The OpenID Connect and AI MCP plugins are not in open-source Kong: a POC needs an Enterprise or
-Konnect trial licence.
-
-## Target flow
+Keycloak (with the `delegation-chain` plugin) still issues every token and builds the nested `act`
+chain. Kong sits between the services: it performs each RFC 8693 token exchange, checks the new
+token's audience, and proxies the services' remaining Keycloak calls. No service talks to Keycloak
+directly.
 
 ```
-alice → web app → agent-1 → [Kong route A1→A2] → agent-2 → [Kong route A2→MCP] → mcp-tool
-                                 │ token exchange           │ token exchange + tool ACL
-                                 └────────── Keycloak 26.8.1 + delegation-chain plugin ──┘
+alice ─login─► Keycloak                          (demo.py: password grant, as on the base branch)
+alice ─T0─► service-1 ─► Kong /service-1/to/service-2 ─T1─► service-2 ─► Kong /service-2/to/service-3 ─T2─► …
+                          │ exchange as service-1                      │ exchange as service-2
+                          ▼                                            ▼
+                    Keycloak token endpoint (subject_token + actor_token + scope delegate-to:<target>)
+services ─► Kong /idp ─► Keycloak   (actor tokens via client_credentials, introspection)
 ```
 
-On the route in front of the next hop, Kong:
-1. validates the incoming token (`verify_signature: true` on the subject token issuer);
-2. calls Keycloak's token endpoint with `grant_type=token-exchange`, the incoming token as
-   `subject_token`, the actor token from the `X-Actor-Token` header, and
-   `scope=delegate-to:<next hop>`;
-3. forwards the new token (`sub=alice`, `act` = full chain, `aud=<next hop>`) upstream.
+## Files
 
-## Constraints
+| File | What |
+|---|---|
+| [`kong.yaml`](kong.yaml) | Kong declarative config (DB-less): one route per caller → callee hop, plus `/idp` |
+| [`../../docker-compose.kong.yml`](../../docker-compose.kong.yml) | Overlay adding Kong Gateway Enterprise 3.16.0.1 and pointing the services at it |
+| [`standin.py`](standin.py) | Local stand-in that reads `kong.yaml` and mimics the documented plugin behaviour, for testing without a licence |
+| `services/service.py` | `EXCHANGE_VIA=gateway`: no exchange in the service; sends its token plus `X-Actor-Token` to the next Kong route |
+| `demo.py` | With `KONG_URL` set, adds five gateway checks |
 
-1. **Kong must authenticate to Keycloak as the acting agent, not as "kong".** Keycloak's delegation
-   check requires the requesting client to equal the `client_id` in the subject token's `may_act`
-   and the actor token's `azp`. So each caller → callee route carries that caller's own client
-   credentials (`client_id`/`client_secret` on the plugin instance). One shared Kong client
-   identity would be refused.
-2. **Kong does not mint the actor token.** Both plugins read it from a request header (or a static
-   value, which would expire). The calling agent still fetches its own `client_credentials`
-   token and sends it as `X-Actor-Token`.
-3. **Exchange conditions.** When subject and target issuer are the same (one Keycloak realm), Kong
-   only exchanges when the configured `conditions` match, e.g. `has_audience: [agent-2]`.
-4. **Tool ACLs are per Consumer.** Mapping `consumer_claim: [act, client_id]` makes the immediate
-   caller the Consumer, so ACLs can say "agent-2 may call `list_orders`". Rules on the whole
-   chain (`act.act.client_id`) are not expressible with the built-in ACLs; the chain can be
-   forwarded to the MCP server with `upstream_headers`, or checked by custom code.
-5. **AI MCP OAuth2 token exchange is tech preview** in 3.14.
+## One hop, e.g. route `/service-1/to/service-2`
 
-## OpenID Connect plugin sketch (route agent-1 → agent-2)
+1. service-1 receives alice's token T0 (`aud=service-1`, `may_act=service-1`).
+2. service-1 gets its own actor token (`client_credentials` through `/idp`) and calls the route
+   with `Authorization: Bearer T0` and `X-Actor-Token: <actor token>`.
+3. The `openid-connect` plugin:
+   - accepts tokens from the realm issuer, verifying the subject token's signature
+     (`verify_signature: true`);
+   - exchanges only when the token is addressed to the caller (`conditions.has_audience: [service-1]`);
+   - calls Keycloak's token endpoint **as service-1** (`client_id`/`client_secret` on this route) with
+     the actor token from `X-Actor-Token` and `scope=delegate-to:service-2`;
+   - requires the token it forwards to carry `aud=service-2` (`audience_required`).
+4. `request-transformer` removes `X-Actor-Token`, so service-2 never sees service-1's actor token.
+5. service-2 receives T1 (`sub=alice`, `act={service-1}`, `aud=service-2`) and validates it.
 
-```yaml
-plugins:
-- name: openid-connect
-  route: agent-1-to-agent-2
-  config:
-    issuer: http://keycloak:8080/realms/rfc8693
-    client_id: [service-1]              # the ACTING agent's Keycloak client
-    client_secret: [service-1-secret]
-    client_auth: [client_secret_post]
-    auth_methods: [bearer]
-    token_exchange:
-      subject_token_issuers:
-      - issuer: http://keycloak:8080/realms/rfc8693
-        verify_signature: true
-        conditions:
-          has_audience: [service-2]     # assumed: exchange tokens addressed to agent-2
-      request:
-        scopes: [delegate-to:service-2]  # assumed: gives the new token may_act=service-2
-        actor_token:
-          source: header
-          header_name: X-Actor-Token
-          type: urn:ietf:params:oauth:token-type:access_token
+## Why each route has its own client credentials
+
+Keycloak's delegation check requires the client making the exchange request to be the agent named
+in the subject token's `may_act`, which is also the actor token's owner. So Kong must call Keycloak as
+the acting service, not as one shared "kong" client. In `kong.yaml` each route carries its caller's
+credentials (the POC's `<client-id>-secret` values; use Kong vault references in a real deployment).
+
+## Run it
+
+**With Kong** (needs a Kong Enterprise or Konnect trial licence; the `openid-connect` plugin is
+Enterprise, actor tokens need 3.16+):
+
+```bash
+export KONG_LICENSE_DATA="$(cat license.json)"
+docker compose -f docker-compose.yml -f docker-compose.kong.yml up -d --build
+docker compose logs -f keycloak-setup      # wait for "done."
+KONG_URL=http://localhost:8000 python3 demo.py
 ```
 
-The assumed `conditions` and `scopes` semantics need verifying against Kong's reference
-docs in the POC.
+**With the stand-in** (no Docker or licence; Java 21, Maven, Python 3 + PyYAML):
 
-## POC plan
+```bash
+./run-local.sh kong-standin     # Keycloak, realm, stand-in on :8000, services in gateway mode, demo
+./run-local.sh stop
+```
 
-1. Kong Gateway Enterprise 3.16 (trial licence) in docker-compose, DB-less, config via decK.
-2. Move the exchange out of `services/service.py` into Kong routes; agents only attach
-   `X-Actor-Token`.
-3. MCP tool behind AI MCP Proxy + AI MCP OAuth2 with tool ACLs on `act.client_id`.
-4. Tests: full chain still reaches the MCP tool; a wrong caller on a route is refused; a token
-   not addressed to the route is not exchanged; a tool ACL denies an agent it doesn't list.
+Keycloak must run with `KC_HOSTNAME=http://localhost:8080` so tokens keep the same issuer when the
+services reach Keycloak through the gateway.
+
+## Tested
+
+Against Keycloak 26.8.1 with the stand-in (not real Kong): **13/13 checks pass**. These include the
+gateway checks:
+
+| Check | Result |
+|---|---|
+| Every hop's exchange done by the gateway; full `act` chain reaches service-4 | pass |
+| No service receives `X-Actor-Token` | pass |
+| service-3's actor token on service-1's route | 401, Keycloak: "Client is not within the token audience" |
+| Token addressed to service-1 sent to service-2's route | 403, no exchange and `audience_required` fails |
+| No actor token | 401, Keycloak: "Subject token with a delegation claim is not allowed for standard token exchange" |
+
+## Not yet verified on real Kong
+
+- Kong's exact behaviour and status codes when the exchange fails (the stand-in returns 401).
+- Whether Kong sends any parameters beyond the ones above (e.g. `requested_token_type`, an empty
+  `audience`) and whether Keycloak accepts them.
+- Kong's exchange cache: `cache_tokens: false` is set so a cached result can't skip Keycloak's actor
+  check; confirm what Kong keys its exchange cache on before enabling caching.
+- `kong.yaml` was written from Kong's docs (github.com/Kong/developer.konghq.com), not validated by
+  Kong itself: run `deck gateway validate` or start Kong with it first.
+
+## Not included (next steps)
+
+- The MCP tool behind Kong's AI MCP Proxy + AI MCP OAuth2 plugins with per-agent tool ACLs
+  (`consumer_claim: [act, client_id]`). AI MCP OAuth2's token exchange is tech preview in 3.14+.
+- The browser login web page (on `claude/keycloak-rfc8693-native`).
