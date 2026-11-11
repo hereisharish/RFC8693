@@ -405,6 +405,7 @@ not deny).
 | S4 | CEL: `source.spiffeId` and nested `jwt.act.act.client_id` in `authorization` and `mcpAuthorization` | Binding and chain rules (sections 7.3) | Unit test with crafted tokens |
 | S5 | Actor token: is there any way for agentgateway to obtain it itself (e.g. an external-auth callout)? | Would remove the last Keycloak-related step from agent code | Read agentgateway source / ask maintainers |
 | S6 | SPIRE docker attestor + compose network setup so a sidecar shares its agent's identity | POC only (Kubernetes does this natively) | Compose test |
+| S7 | Does Keycloak evaluate the FGAP `delegate` permission for the user when `delegate-to:<next>` is requested during an exchange (not only at login)? Can the permission target a group of users? | Per-user chain control at issuance (13.3) | Remove one agent from the permission and run the chain |
 
 ---
 
@@ -431,7 +432,90 @@ not deny).
 
 ---
 
-## 13. References
+## 13. Who can do what, and registering workloads
+
+Four questions, each answered in layers: **Keycloak decides what tokens get issued**, and the
+**receiving gateway enforces at runtime**. A request has to pass both.
+
+### 13.1 Which user can access which workload (agent)?
+
+**Model:** one Keycloak group per agent, e.g. `agent-1-users`. Membership = "this user may use agent-1".
+
+| Layer | Check | How |
+|---|---|---|
+| Keycloak, at login | May agent-1 act for this user? | The user requests `delegation:client:agent-1` and consents. Keycloak evaluates the FGAP `delegate` permission: agent-1's service account must be allowed to delegate for this user. The permission can name specific users or all users |
+| Keycloak, optional hard block | Can this user log in to the front end at all? | Built-in authentication flow: *Condition - user role* + *Deny access* |
+| agent-1's gateway, every request | Is the user in `agent-1-users`? | `authorization` rule `"agent-1-users" in jwt.groups`. Needs a *Group Membership* mapper in a default client scope on every agent client, so the claim survives each exchange |
+
+Groups rather than roles: our agent clients have `fullScopeAllowed` off, which filters roles out of
+tokens; group membership mappers aren't affected by that.
+
+### 13.2 Which workload can access which tool?
+
+| Layer | Check | How |
+|---|---|---|
+| Connection (SPIFFE) | Which workloads may connect to the tool at all? | Tool gateway rule `source.spiffeId in [".../sa/agent-2", ...]` |
+| Caller's egress | Can agent-2 even reach the tool? | Only workloads with an egress route to the tool can call it; the route also pins the tool's SPIFFE ID (`backendTLS.subjectAltNames`) |
+| Keycloak, at exchange | Can a token for the tool be issued? | The tool must be a valid delegation target: a client with a service account, covered by the FGAP `delegate` permission. **Gap:** Keycloak can't say "agent-2 may request `delegate-to:mcp-tool` but agent-3 may not"; the scope is granted per client, not per caller/target pair. So pair rules live in the gateway |
+| Tool gateway, per tool | Which agent may call which tool? | `mcpAuthorization` rule, e.g. `mcp.tool.name == "list_orders" && jwt.azp == "agent-2"` |
+
+### 13.3 Is this delegation chain allowed for this user?
+
+| Layer | Check | How |
+|---|---|---|
+| Keycloak, each link | May the next agent act for this user? | First link: the user's consent. Every later link: when agent-N requests `delegate-to:agent-N+1`, Keycloak evaluates the FGAP `delegate` permission of agent-N+1 against this user (spike S7: confirm it runs at exchange time) |
+| Every receiving gateway | Is the user allowed through this exact path? | CEL over `sub`/groups and the `act` chain, e.g. at the tool: `"finance" in jwt.groups && jwt.act.client_id == "agent-2" && jwt.act.act.client_id == "agent-1"` |
+| Every receiving gateway | Is the chain too long? | e.g. `!has(jwt.act.act.act)` (at most 2 agents before the tool) |
+
+**Phase 1:** CEL rules generated from one access matrix. **When the matrix grows** (many users ×
+agents × tools), move the decision to OPA with the matrix as data, called through agentgateway's
+external authorization.
+
+Example matrix (the single source the rules are generated from):
+
+| User group | May use agent | Allowed chains | Tools at the end |
+|---|---|---|---|
+| `finance` | agent-1 | agent-1 → agent-2 → mcp-tool | `list_orders`, `get_invoice` |
+| `support` | agent-1 | agent-1 → mcp-tool | `get_user` |
+| everyone else | none | none | none |
+
+### 13.4 How do we register a workload?
+
+Registering an agent or tool creates **three linked records**, which must agree on one name
+(the service account name, e.g. `agent-3`):
+
+| # | Record | Where | What |
+|---|---|---|---|
+| 1 | **Workload identity** | SPIRE | Kubernetes: automatic, from a `ClusterSPIFFEID` (`spiffe://agents.example.com/ns/<ns>/sa/<sa>`); the pod's namespace and service account are the attestation selectors. Also set a DNS name = `<sa>` so the SVID's CN is the Keycloak `client_id` (D3). POC: `spire-server entry create -spiffeID … -selector docker:label:… -dns agent-3` |
+| 2 | **OAuth client** | Keycloak | `client_id = <sa>`; confidential; client authenticator `client-x509` with `x509.subjectdn` `(.*?)CN=agent-3(?:,.*)?$`; service account on; `standard.token.exchange.enabled`; optional scope `delegate-to`; group-membership mapper scope; add to the FGAP `delegate` permission if others may delegate to it; group `agent-3-users` |
+| 3 | **Policy + sidecar** | agentgateway config | Inbound rules (who may call it, which users), egress routes (which targets it may call, pinned SPIFFE IDs, exchange settings), tool rules for MCP servers |
+
+**Process:**
+1. The team submits one **workload manifest** (below) by pull request.
+2. **Security reviews and approves it.** Registration is security-critical: whoever can register
+   `CN=agent-1` or the `agent-1` service account can act as agent-1.
+3. A pipeline applies it: SPIRE (ClusterSPIFFEID / entries), Keycloak (admin API, Terraform's
+   Keycloak provider or keycloak-config-cli), and the gateway config.
+4. A smoke test proves the workload gets an SVID, logs in to Keycloak with it, and is refused
+   everywhere the matrix doesn't allow it.
+
+```yaml
+# workloads/agent-3.yaml (illustrative)
+name: agent-3                     # service account = Keycloak client_id = SVID CN
+namespace: agents
+kind: agent                       # agent | tool
+owner: team-payments
+users: [finance]                  # groups allowed to use it      → 13.1
+calls: [mcp-tool]                 # targets it may call           → egress routes, 13.2
+callers: [agent-1]                # who may call it               → inbound rules
+delegation_target: true           # may others delegate to it     → FGAP delegate
+tools: {}                         # for kind: tool, per-tool rules → mcpAuthorization
+```
+
+**Deregistration** reverses all three, so a removed agent can't get an SVID, can't log in to
+Keycloak, and can't be reached.
+
+## 14. References
 
 - RFC 8693 OAuth 2.0 Token Exchange: https://www.rfc-editor.org/rfc/rfc8693
 - RFC 8705 OAuth 2.0 Mutual-TLS Client Authentication: https://www.rfc-editor.org/rfc/rfc8705
